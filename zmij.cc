@@ -496,6 +496,76 @@ inline void write8(char* buffer, uint64_t value) noexcept {
   memcpy(buffer, &value, 8);
 }
 
+struct Result {
+  char* end;
+  uint32_t exp_bits;
+};
+
+#if ZMIJ_USE_SIMD
+auto write_significand17_get_exp(char* buffer, uint64_t value,
+                         bool has17digits, uint16_t decexp) noexcept -> Result {
+  uint64_t digits_16 =
+      use_umul128_hi64 ? umul128_hi64(value, div10_sig64) : value / 10;
+  uint32_t last_digit = value - digits_16 * 10;
+
+  // We always write 17 digits into the buffer, but the first one can be zero.
+  // buffer points to the second place in the output buffer to allow for the
+  // insertion of the decimal point, so we can use the first place as scratch.
+  buffer += has17digits;
+  buffer[16] = char(last_digit + '0');
+
+  uint32_t abcdefgh = digits_16 / uint64_t(1e8);
+  uint32_t ijklmnop = digits_16 % uint64_t(1e8);
+
+  alignas(64) static const struct {
+    __m128i div10k = _mm_set1_epi64x(div10k_sig);
+    __m128i neg10k = _mm_set1_epi64x(::neg10k);
+    __m256i div100 = _mm256_set1_epi32(div100_sig);
+    __m256i neg100 = _mm256_set1_epi32(::neg100);
+    __m256i div10 = _mm256_set1_epi16((1 << 16) / 10 + 1);
+    __m256i neg10 = _mm256_set1_epi16((1 << 8) - 10);
+    __m256i bswap =
+        _mm256_set_epi8(
+          -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 16, 17, 18,
+           0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15);
+    __m128i zeros = _mm_set1_epi64x(::zeros);
+  } c;
+
+  // The BCD sequences are based on ones provided by Xiang JunBo.
+  __m128i abcdefgh_ijklmnop = _mm_set_epi64x(abcdefgh, ijklmnop);
+  __m128i abcd_efgh_ijkl_mnop = _mm_add_epi64(
+      abcdefgh_ijklmnop, _mm_mul_epu32(c.neg10k,
+                       _mm_srli_epi64(_mm_mul_epu32(abcdefgh_ijklmnop, c.div10k), div10k_exp)));
+
+  __m256i exp_abcd_efgh_ijkl_mnop = _mm256_insert_epi16(
+    _mm256_castsi128_si256(abcd_efgh_ijkl_mnop), decexp, 8);
+
+  __m256i z = _mm256_add_epi64(
+      exp_abcd_efgh_ijkl_mnop, _mm256_mullo_epi32(c.neg100,
+                         _mm256_srli_epi32(_mm256_mulhi_epu16(exp_abcd_efgh_ijkl_mnop, c.div100), 3)));
+  __m256i big_endian_bcd =
+      _mm256_add_epi16(z, _mm256_mullo_epi16(c.neg10, _mm256_mulhi_epu16(z, c.div10)));
+  __m256i bcd = _mm256_shuffle_epi8(big_endian_bcd, c.bswap);
+
+  auto digits = _mm_or_si128(_mm256_castsi256_si128(bcd), c.zeros);
+
+  // determine number of leading zeros
+  __m128i mask128 = _mm_cmpgt_epi8(_mm256_castsi256_si128(bcd), _mm_setzero_si128());
+  uint16_t mask = _mm_movemask_epi8(mask128);
+  // We don't need a zero-check here: if the mask were zero, either the
+  // significand is zero which is handled elsewhere or the only non-zero digit
+  // is the last digit which we factored off. But in that case the number would
+  // be printed with a different exponent that shifts the last digit into the
+  // first position.
+  auto len = size_t(64) - clz(mask);  // size_t for native arithmetic
+
+  _mm_storeu_si128(reinterpret_cast<__m128i*>(buffer), digits);
+
+  uint32_t exp_bits = _mm256_extract_epi32(bcd, 4) | 0x00303030;
+  return { buffer + ((last_digit != 0) ? 17 : len - (len == 1)), exp_bits };
+}
+#endif
+
 // Writes a significand consisting of up to 17 decimal digits (16-17 for
 // normals) and removes trailing zeros.  The significant digits start
 // from buffer[1].  buffer[0] may contain '0' after this function if
@@ -585,7 +655,7 @@ auto write_significand17(char* buffer, uint64_t value,
   uint32_t abcdefgh = digits_16 / uint64_t(1e8);
   uint32_t ijklmnop = digits_16 % uint64_t(1e8);
 
-  alignas(64) static const struct {
+  alignas(64) const struct {
     __m128i div10k = _mm_set1_epi64x(div10k_sig);
     __m128i neg10k = _mm_set1_epi64x(::neg10k);
     __m128i div100 = _mm_set1_epi32(div100_sig);
@@ -597,32 +667,32 @@ auto write_significand17(char* buffer, uint64_t value,
         _mm_set_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
 #  else
     __m128i hundred = _mm_set1_epi32(100);
-    __m128i moddiv10 = _mm_set1_epi16(10 * (1 << 8) - 1);
+    __m128i moddiv10 = _mm_set1_epi16(-10 * (1 << 8) + 1);
 #  endif  // ZMIJ_USE_SSE4_1
     __m128i zeros = _mm_set1_epi64x(::zeros);
   } c;
 
   // The BCD sequences are based on ones provided by Xiang JunBo.
-  __m128i x = _mm_set_epi64x(abcdefgh, ijklmnop);
-  __m128i y = _mm_add_epi64(
-      x, _mm_mul_epu32(c.neg10k,
-                       _mm_srli_epi64(_mm_mul_epu32(x, c.div10k), div10k_exp)));
+  __m128i abcdefgh_ijklmnop = _mm_set_epi64x(abcdefgh, ijklmnop);
+  __m128i abcd_efgh_ijkl_mnop = _mm_add_epi64(
+      abcdefgh_ijklmnop, _mm_mul_epu32(c.neg10k,
+                       _mm_srli_epi64(_mm_mul_epu32(abcdefgh_ijklmnop, c.div10k), div10k_exp)));
 #  if ZMIJ_USE_SSE4_1
   // _mm_mullo_epi32 is SSE 4.1
   __m128i z = _mm_add_epi64(
-      y, _mm_mullo_epi32(c.neg100,
-                         _mm_srli_epi32(_mm_mulhi_epu16(y, c.div100), 3)));
+      abcd_efgh_ijkl_mnop, _mm_mullo_epi32(c.neg100,
+                         _mm_srli_epi32(_mm_mulhi_epu16(abcd_efgh_ijkl_mnop, c.div100), 3)));
   __m128i big_endian_bcd =
       _mm_add_epi16(z, _mm_mullo_epi16(c.neg10, _mm_mulhi_epu16(z, c.div10)));
   __m128i bcd = _mm_shuffle_epi8(big_endian_bcd, c.bswap);  // SSSE3
 #  else
-  __m128i y_div_100 = _mm_srli_epi16(_mm_mulhi_epu16(y, c.div100), 3);
-  __m128i y_mod_100 = _mm_sub_epi16(y, _mm_mullo_epi16(y_div_100, c.hundred));
-  __m128i z = _mm_or_si128(_mm_slli_epi32(y_mod_100, 16), y_div_100);
-  __m128i bcd_shuffled =
-      _mm_sub_epi16(_mm_slli_epi16(z, 8),
-                    _mm_mullo_epi16(c.moddiv10, _mm_mulhi_epu16(z, c.div10)));
-  __m128i bcd = _mm_shuffle_epi32(bcd_shuffled, _MM_SHUFFLE(0, 1, 2, 3));
+  __m128i ab_ef_ij_mn = _mm_srli_epi16(_mm_mulhi_epu16(abcd_efgh_ijkl_mnop, c.div100), 3);
+  __m128i cd_gh_kl_op = _mm_sub_epi16(abcd_efgh_ijkl_mnop, _mm_mullo_epi16(ab_ef_ij_mn, c.hundred));
+  __m128i cd_ab_gh_ef_kl_ij_op_mn = _mm_or_si128(_mm_slli_epi32(cd_gh_kl_op, 16), ab_ef_ij_mn);
+  __m128i d_c_b_a_h_g_f_e_l_k_j_i_p_o_n_m =
+      _mm_add_epi16(_mm_slli_epi16(cd_ab_gh_ef_kl_ij_op_mn, 8),
+                    _mm_mullo_epi16(c.moddiv10, _mm_mulhi_epu16(cd_ab_gh_ef_kl_ij_op_mn, c.div10)));
+  __m128i bcd = _mm_shuffle_epi32(d_c_b_a_h_g_f_e_l_k_j_i_p_o_n_m, _MM_SHUFFLE(0, 1, 2, 3));
 #  endif  // ZMIJ_USE_SSE4_1
 
   auto digits = _mm_or_si128(bcd, c.zeros);
@@ -882,7 +952,21 @@ auto write(Float value, char* buffer) noexcept -> char* {
   if (traits::num_bits == 64) {
     bool has17digits = dec.sig >= uint64_t(1e16);
     dec_exp += traits::max_digits10 - 2 + has17digits;
+#if ZMIJ_USE_SIMD
+    uint16_t dec_exp_abs = dec_exp > 0 ? dec_exp : -dec_exp;
+    auto [end, exp_bits] = write_significand17_get_exp(buffer, dec.sig, has17digits, dec_exp_abs);
+    buffer = end;
+    start[0] = start[1];
+    start[1] = '.';
+    memcpy(buffer + 1 + (dec_exp_abs >= 100), &exp_bits, 4);
+    uint16_t e_sign = dec_exp >= 0 ? ('+' << 8 | 'e') : ('-' << 8 | 'e');
+    if (is_big_endian()) e_sign = e_sign << 8 | e_sign >> 8;
+    memcpy(buffer, &e_sign, 2);
+    buffer += 4 + (dec_exp_abs >= 100);
+    return buffer;
+#else
     buffer = write_significand17(buffer, dec.sig, has17digits);
+#endif
   } else {
     if (dec.sig < uint32_t(1e7)) [[ZMIJ_UNLIKELY]] {
       dec.sig *= 10;
