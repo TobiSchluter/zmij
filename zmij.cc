@@ -624,7 +624,7 @@ auto write_significand17(char* buffer, uint64_t value, bool has17digits,
   alignas(64) static constexpr struct {
     __m128i div10k = splat64(div10k_sig);
     __m128i neg10k = splat64(::neg10k);
-    __m128i div100 = splat32(div100_sig);
+    __m128i div100 = splat16(div100_sig);
     __m128i div10 = splat16((1 << 16) / 10 + 1);
 #  if ZMIJ_USE_SSE4_1
     __m128i neg100 = splat32(::neg100);
@@ -632,7 +632,7 @@ auto write_significand17(char* buffer, uint64_t value, bool has17digits,
     __m128i bswap = __m128i{pack8(15, 14, 13, 12, 11, 10, 9, 8),
                             pack8(7, 6, 5, 4, 3, 2, 1, 0)};
 #  else
-    __m128i hundred = splat32(100);
+    __m128i hundred = splat16(100);
     __m128i moddiv10 = splat16(10 * (1 << 8) - 1);
 #  endif
     __m128i zeros = splat64(::zeros);
@@ -666,9 +666,10 @@ auto write_significand17(char* buffer, uint64_t value, bool has17digits,
       _mm_add_epi16(z, _mm_mullo_epi16(neg10, _mm_mulhi_epu16(z, div10)));
   __m128i bcd = _mm_shuffle_epi8(big_endian_bcd, bswap);  // SSSE3
 #  else
-  __m128i y_div_100 = _mm_srli_epi16(_mm_mulhi_epu16(y, div100), 3);
-  __m128i y_mod_100 = _mm_sub_epi16(y, _mm_mullo_epi16(y_div_100, hundred));
-  __m128i z = _mm_or_si128(_mm_slli_epi32(y_mod_100, 16), y_div_100);
+  __m64 y_packed = _mm_cvtsi64_m64(_mm_cvtsi128_si64(_mm_packs_epi32(y, _mm_setzero_si128())));
+  __m64 y_div_100 = _mm_srli_pi16(_mm_mulhi_pu16(y_packed, _mm_cvtsi64_m64(_mm_cvtsi128_si64(div100))), 3);
+  __m64 y_mod_100 = _mm_sub_pi16(y_packed, _mm_mullo_pi16(y_div_100, _mm_cvtsi64_m64(_mm_cvtsi128_si64(hundred))));
+  __m128i z = _mm_unpacklo_epi16(_mm_movpi64_epi64(y_div_100), _mm_movpi64_epi64(y_mod_100));
   __m128i bcd_shuffled =
       _mm_sub_epi16(_mm_slli_epi16(z, 8),
                     _mm_mullo_epi16(moddiv10, _mm_mulhi_epu16(z, div10)));
