@@ -441,15 +441,15 @@ inline auto count_trailing_nonzeros(uint64_t x) noexcept -> int {
 // Converts value in the range [0, 100) to a string. GCC generates a bit better
 // code when value is pointer-size (https://www.godbolt.org/z/5fEPMT1cc).
   alignas(4) static const char digits2_data[] =
-      "..0001020304050607080910111213141516171819"
-      "2021222324252627282930313233343536373839"
-      "4041424344454647484950515253545556575859"
-      "6061626364656667686970717273747576777879"
-      "8081828384858687888990919293949596979899..";
+      "\000\00000\000\00001\000\00002\000\00003\000\00004\000\00005\000\00006\000\00007\000\00008\000\00009\000\00010\000\00011\000\00012\000\00013\000\00014\000\00015\000\00016\000\00017\000\00018\000\00019\000\000"
+      "20\000\00021\000\00022\000\00023\000\00024\000\00025\000\00026\000\00027\000\00028\000\00029\000\00030\000\00031\000\00032\000\00033\000\00034\000\00035\000\00036\000\00037\000\00038\000\00039\000\000"
+      "40\000\00041\000\00042\000\00043\000\00044\000\00045\000\00046\000\00047\000\00048\000\00049\000\00050\000\00051\000\00052\000\00053\000\00054\000\00055\000\00056\000\00057\000\00058\000\00059\000\000"
+      "60\000\00061\000\00062\000\00063\000\00064\000\00065\000\00066\000\00067\000\00068\000\00069\000\00070\000\00071\000\00072\000\00073\000\00074\000\00075\000\00076\000\00077\000\00078\000\00079\000\000"
+      "80\000\00081\000\00082\000\00083\000\00084\000\00085\000\00086\000\00087\000\00088\000\00089\000\00090\000\00091\000\00092\000\00093\000\00094\000\00095\000\00096\000\00097\000\00098\000\00099\000\000";
 inline auto digits2(size_t value) noexcept -> const char* {
   // Align data since unaligned access may be slower when crossing a
   // hardware-specific boundary.
-  return &digits2_data[value * 2 + 2];
+  return &digits2_data[value * 4 + 2];
 }
 
 constexpr int div10k_exp = 40;
@@ -681,10 +681,10 @@ inline auto write_significand(char* buffer, uint64_t value, bool extra_digit,
   __m128i y = _mm_shuffle_epi32(y_shuffled, _MM_SHUFFLE(0, 1, 2, 3));
   __m128i y_div_100 = _mm_srli_epi16(_mm_mulhi_epu16(y, div100), 3);
   __m128i y_mod_100 = _mm_sub_epi16(y, _mm_mullo_epi16(y_div_100, hundred));
-  __m128i gathered_div = _mm_i32gather_epi32((const int*)(digits2_data + 2), y_div_100, 2);
-  __m128i gathered_mod = _mm_i32gather_epi32((const int*)(digits2_data), y_mod_100, 2);
+  __m128i gathered_div = _mm_i32gather_epi32((const int*)(digits2_data + 2), y_div_100, 4);
+  __m128i gathered_mod = _mm_i32gather_epi32((const int*)(digits2_data), y_mod_100, 4);
   //__m128i z = _mm_or_si128(_mm_slli_epi32(y_mod_100, 16), y_div_100);
-  __m128i digits = _mm_blend_epi16(gathered_div, gathered_mod, 0xaa);
+  __m128i digits = _mm_or_si128(gathered_div, gathered_mod);
   //__m128i digits = _mm_shuffle_epi8(digits_shuffled, _mm_setr_epi8(6, 7, 14, 15, 4, 5, 12, 13, 2, 3, 10, 11, 0, 1, 8, 9)); //_mm_shuffle_epi32(digits_shuffled, _MM_SHUFFLE(0, 1, 2, 3));
   //__m128i bcd_shuffled =
   //    _mm_sub_epi16(_mm_slli_epi16(z, 8),
