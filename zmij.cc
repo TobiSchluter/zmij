@@ -440,16 +440,16 @@ inline auto count_trailing_nonzeros(uint64_t x) noexcept -> int {
 
 // Converts value in the range [0, 100) to a string. GCC generates a bit better
 // code when value is pointer-size (https://www.godbolt.org/z/5fEPMT1cc).
-inline auto digits2(size_t value) noexcept -> const char* {
-  // Align data since unaligned access may be slower when crossing a
-  // hardware-specific boundary.
-  alignas(2) static const char data[] =
-      "0001020304050607080910111213141516171819"
+  alignas(4) static const char digits2_data[] =
+      "..0001020304050607080910111213141516171819"
       "2021222324252627282930313233343536373839"
       "4041424344454647484950515253545556575859"
       "6061626364656667686970717273747576777879"
-      "8081828384858687888990919293949596979899";
-  return &data[value * 2];
+      "8081828384858687888990919293949596979899..";
+inline auto digits2(size_t value) noexcept -> const char* {
+  // Align data since unaligned access may be slower when crossing a
+  // hardware-specific boundary.
+  return &digits2_data[value * 2 + 2];
 }
 
 constexpr int div10k_exp = 40;
@@ -506,7 +506,7 @@ inline auto read8(char* buffer) noexcept -> uint64_t {
 // (8-9 for normals) for float. The significant digits start from buffer[1].
 // buffer[0] may contain '0' after this function if the leading digit is zero.
 template <int num_bits, bool use_sse = ZMIJ_USE_SSE != 0 && num_bits == 64>
-auto write_significand(char* buffer, uint64_t value, bool extra_digit,
+inline auto write_significand(char* buffer, uint64_t value, bool extra_digit,
                        long long value_div10) noexcept -> char* {
   if (num_bits == 32) {
     buffer = write_if(buffer, value / 100'000'000, extra_digit);
@@ -628,17 +628,21 @@ auto write_significand(char* buffer, uint64_t value, bool extra_digit,
     uint128 div10k = splat64(div10k_sig);
     uint128 neg10k = splat64(::neg10k);
     uint128 div100 = splat32(div100_sig);
-    uint128 div10 = splat16((1 << 16) / 10 + 1);
-#  if ZMIJ_USE_SSE4_1
+    //uint128 div10 = splat16((1 << 16) / 10 + 1);
+#  if 0 && ZMIJ_USE_SSE4_1
     uint128 neg100 = splat32(::neg100);
     uint128 neg10 = splat16((1 << 8) - 10);
     uint128 bswap = uint128{pack8(15, 14, 13, 12, 11, 10, 9, 8),
                             pack8(7, 6, 5, 4, 3, 2, 1, 0)};
 #  else
     uint128 hundred = splat32(100);
-    uint128 moddiv10 = splat16(10 * (1 << 8) - 1);
+    //uint128 moddiv10 = splat16(10 * (1 << 8) - 1);
 #  endif
+
     uint128 zeros = splat64(::zeros);
+    uint128 tbl_digits = uint128{pack8('0', '1' + 0x80, '2' + 0x80, '3' + 0x80, '4' + 0x80, '5' + 0x80, '6' + 0x80, '7' + 0x80),
+                                 pack8('8' + 0x80, '9' + 0x80, 'a' + 0x80, 'b' + 0x80, 'c' + 0x80, 'd' + 0x80, 'e' + 0x80, 'f' + 0x80)};
+    uint128 digit_mask = splat16(0x3f3f);
   } consts;
   const auto* c = &consts;
   ZMIJ_ASM(("" : "+r"(c)));  // Load constants from memory.
@@ -647,23 +651,25 @@ auto write_significand(char* buffer, uint64_t value, bool extra_digit,
   const __m128i div10k = _mm_load_si128(ptr(&c->div10k));
   const __m128i neg10k = _mm_load_si128(ptr(&c->neg10k));
   const __m128i div100 = _mm_load_si128(ptr(&c->div100));
-  const __m128i div10 = _mm_load_si128(ptr(&c->div10));
-#  if ZMIJ_USE_SSE4_1
+  //const __m128i div10 = _mm_load_si128(ptr(&c->div10));
+#  if 0 && ZMIJ_USE_SSE4_1
   const __m128i neg100 = _mm_load_si128(ptr(&c->neg100));
   const __m128i neg10 = _mm_load_si128(ptr(&c->neg10));
   const __m128i bswap = _mm_load_si128(ptr(&c->bswap));
 #  else
   const __m128i hundred = _mm_load_si128(ptr(&c->hundred));
-  const __m128i moddiv10 = _mm_load_si128(ptr(&c->moddiv10));
+  //const __m128i moddiv10 = _mm_load_si128(ptr(&c->moddiv10));
 #  endif
   const __m128i zeros = _mm_load_si128(ptr(&c->zeros));
+  const __m128i tbl_digits = _mm_load_si128(ptr(&c->tbl_digits));
+  const __m128i digit_mask = _mm_load_si128(ptr(&c->digit_mask));
 
   // The BCD sequences are based on the ones provided by Xiang JunBo.
   __m128i x = _mm_set_epi64x(abcdefgh, ijklmnop);
-  __m128i y = _mm_add_epi64(
+  __m128i y_shuffled = _mm_add_epi64(
       x, _mm_mul_epu32(neg10k,
                        _mm_srli_epi64(_mm_mul_epu32(x, div10k), div10k_exp)));
-#  if ZMIJ_USE_SSE4_1
+#  if 0 && ZMIJ_USE_SSE4_1
   // _mm_mullo_epi32 is SSE 4.1
   __m128i z = _mm_add_epi64(
       y,
@@ -672,20 +678,26 @@ auto write_significand(char* buffer, uint64_t value, bool extra_digit,
       _mm_add_epi16(z, _mm_mullo_epi16(neg10, _mm_mulhi_epu16(z, div10)));
   __m128i bcd = _mm_shuffle_epi8(big_endian_bcd, bswap);  // SSSE3
 #  else
+  __m128i y = _mm_shuffle_epi32(y_shuffled, _MM_SHUFFLE(0, 1, 2, 3));
   __m128i y_div_100 = _mm_srli_epi16(_mm_mulhi_epu16(y, div100), 3);
   __m128i y_mod_100 = _mm_sub_epi16(y, _mm_mullo_epi16(y_div_100, hundred));
-  __m128i z = _mm_or_si128(_mm_slli_epi32(y_mod_100, 16), y_div_100);
-  __m128i bcd_shuffled =
-      _mm_sub_epi16(_mm_slli_epi16(z, 8),
-                    _mm_mullo_epi16(moddiv10, _mm_mulhi_epu16(z, div10)));
-  __m128i bcd = _mm_shuffle_epi32(bcd_shuffled, _MM_SHUFFLE(0, 1, 2, 3));
+  __m128i gathered_div = _mm_i32gather_epi32((const int*)(digits2_data + 2), y_div_100, 2);
+  __m128i gathered_mod = _mm_i32gather_epi32((const int*)(digits2_data), y_mod_100, 2);
+  //__m128i z = _mm_or_si128(_mm_slli_epi32(y_mod_100, 16), y_div_100);
+  __m128i digits = _mm_blend_epi16(gathered_div, gathered_mod, 0xaa);
+  //__m128i digits = _mm_shuffle_epi8(digits_shuffled, _mm_setr_epi8(6, 7, 14, 15, 4, 5, 12, 13, 2, 3, 10, 11, 0, 1, 8, 9)); //_mm_shuffle_epi32(digits_shuffled, _MM_SHUFFLE(0, 1, 2, 3));
+  //__m128i bcd_shuffled =
+  //    _mm_sub_epi16(_mm_slli_epi16(z, 8),
+  //                  _mm_mullo_epi16(moddiv10, _mm_mulhi_epu16(z, div10)));
 #  endif  // ZMIJ_USE_SSE4_1
 
-  auto digits = _mm_or_si128(bcd, zeros);
+  //auto digits = _mm_or_si128(bcd, zeros);
+  //auto digits_flagged = _mm_shuffle_epi8(tbl_digits, bcd);
 
   // Count leading zeros.
-  __m128i mask128 = _mm_cmpgt_epi8(bcd, _mm_setzero_si128());
+  __m128i mask128 = _mm_cmpgt_epi8(digits, zeros);
   uint32_t mask = _mm_movemask_epi8(mask128);
+  //auto digits = _mm_and_si128(digits_flagged, digit_mask);
   // We don't need a zero-check here: if the mask were zero, either the
   // significand is zero which is handled elsewhere or the only non-zero digit
   // is the last digit which we factored off. But in that case the number would
