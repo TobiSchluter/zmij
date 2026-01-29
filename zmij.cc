@@ -440,16 +440,34 @@ inline auto count_trailing_nonzeros(uint64_t x) noexcept -> int {
 
 // Converts value in the range [0, 100) to a string. GCC generates a bit better
 // code when value is pointer-size (https://www.godbolt.org/z/5fEPMT1cc).
-  alignas(4) static const char digits2_data[] =
+#if 0
+  alignas(2) static const char digits2_data[] =
       "\000\00000\000\00001\000\00002\000\00003\000\00004\000\00005\000\00006\000\00007\000\00008\000\00009\000\00010\000\00011\000\00012\000\00013\000\00014\000\00015\000\00016\000\00017\000\00018\000\00019\000\000"
       "20\000\00021\000\00022\000\00023\000\00024\000\00025\000\00026\000\00027\000\00028\000\00029\000\00030\000\00031\000\00032\000\00033\000\00034\000\00035\000\00036\000\00037\000\00038\000\00039\000\000"
       "40\000\00041\000\00042\000\00043\000\00044\000\00045\000\00046\000\00047\000\00048\000\00049\000\00050\000\00051\000\00052\000\00053\000\00054\000\00055\000\00056\000\00057\000\00058\000\00059\000\000"
       "60\000\00061\000\00062\000\00063\000\00064\000\00065\000\00066\000\00067\000\00068\000\00069\000\00070\000\00071\000\00072\000\00073\000\00074\000\00075\000\00076\000\00077\000\00078\000\00079\000\000"
       "80\000\00081\000\00082\000\00083\000\00084\000\00085\000\00086\000\00087\000\00088\000\00089\000\00090\000\00091\000\00092\000\00093\000\00094\000\00095\000\00096\000\00097\000\00098\000\00099\000\000";
+#else
+#if 0
+  alignas(2) static const char digits2_data[] =
+      "..0001020304050607080910111213141516171819"
+      "2021222324252627282930313233343536373839"
+      "4041424344454647484950515253545556575859"
+      "6061626364656667686970717273747576777879"
+      "8081828384858687888990919293949596979899"
+      ".."; // filler to avoid read beyond end
+#endif
+  alignas(1) static const char digits2_data[] =
+      "00000101020203030404050506060707080809091010111112121313141415151616171718181919"
+      "20202121222223232424252526262727282829293030313132323333343435353636373738383939"
+      "40404141424243434444454546464747484849495050515152525353545455555656575758585959"
+      "60606161626263636464656566666767686869697070717172727373747475757676777778787979"
+      "80808181828283838484858586868787888889899090919192929393949495959696979798989999";
+#endif
 inline auto digits2(size_t value) noexcept -> const char* {
   // Align data since unaligned access may be slower when crossing a
   // hardware-specific boundary.
-  return &digits2_data[value * 4 + 2];
+  return &digits2_data[value * 4];
 }
 
 constexpr int div10k_exp = 40;
@@ -628,21 +646,13 @@ inline auto write_significand(char* buffer, uint64_t value, bool extra_digit,
     uint128 div10k = splat64(div10k_sig);
     uint128 neg10k = splat64(::neg10k);
     uint128 div100 = splat32(div100_sig);
-    //uint128 div10 = splat16((1 << 16) / 10 + 1);
-#  if 0 && ZMIJ_USE_SSE4_1
-    uint128 neg100 = splat32(::neg100);
-    uint128 neg10 = splat16((1 << 8) - 10);
-    uint128 bswap = uint128{pack8(15, 14, 13, 12, 11, 10, 9, 8),
-                            pack8(7, 6, 5, 4, 3, 2, 1, 0)};
-#  else
     uint128 hundred = splat32(100);
-    //uint128 moddiv10 = splat16(10 * (1 << 8) - 1);
-#  endif
 
     uint128 zeros = splat64(::zeros);
-    uint128 tbl_digits = uint128{pack8('0', '1' + 0x80, '2' + 0x80, '3' + 0x80, '4' + 0x80, '5' + 0x80, '6' + 0x80, '7' + 0x80),
-                                 pack8('8' + 0x80, '9' + 0x80, 'a' + 0x80, 'b' + 0x80, 'c' + 0x80, 'd' + 0x80, 'e' + 0x80, 'f' + 0x80)};
-    uint128 digit_mask = splat16(0x3f3f);
+    //uint128 tbl_digits = uint128{pack8('0', '1' + 0x80, '2' + 0x80, '3' + 0x80, '4' + 0x80, '5' + 0x80, '6' + 0x80, '7' + 0x80),
+    //                             pack8('8' + 0x80, '9' + 0x80, 'a' + 0x80, 'b' + 0x80, 'c' + 0x80, 'd' + 0x80, 'e' + 0x80, 'f' + 0x80)};
+    //uint128 digit_mask = splat16(0x3f3f);
+    uint128 all_ones = splat16(0xffff);
   } consts;
   const auto* c = &consts;
   ZMIJ_ASM(("" : "+r"(c)));  // Load constants from memory.
@@ -651,45 +661,21 @@ inline auto write_significand(char* buffer, uint64_t value, bool extra_digit,
   const __m128i div10k = _mm_load_si128(ptr(&c->div10k));
   const __m128i neg10k = _mm_load_si128(ptr(&c->neg10k));
   const __m128i div100 = _mm_load_si128(ptr(&c->div100));
-  //const __m128i div10 = _mm_load_si128(ptr(&c->div10));
-#  if 0 && ZMIJ_USE_SSE4_1
-  const __m128i neg100 = _mm_load_si128(ptr(&c->neg100));
-  const __m128i neg10 = _mm_load_si128(ptr(&c->neg10));
-  const __m128i bswap = _mm_load_si128(ptr(&c->bswap));
-#  else
   const __m128i hundred = _mm_load_si128(ptr(&c->hundred));
-  //const __m128i moddiv10 = _mm_load_si128(ptr(&c->moddiv10));
-#  endif
   const __m128i zeros = _mm_load_si128(ptr(&c->zeros));
-  const __m128i tbl_digits = _mm_load_si128(ptr(&c->tbl_digits));
-  const __m128i digit_mask = _mm_load_si128(ptr(&c->digit_mask));
+  const __m128i all_ones = _mm_load_si128(ptr(&c->all_ones));
 
   // The BCD sequences are based on the ones provided by Xiang JunBo.
   __m128i x = _mm_set_epi64x(abcdefgh, ijklmnop);
   __m128i y_shuffled = _mm_add_epi64(
       x, _mm_mul_epu32(neg10k,
                        _mm_srli_epi64(_mm_mul_epu32(x, div10k), div10k_exp)));
-#  if 0 && ZMIJ_USE_SSE4_1
-  // _mm_mullo_epi32 is SSE 4.1
-  __m128i z = _mm_add_epi64(
-      y,
-      _mm_mullo_epi32(neg100, _mm_srli_epi32(_mm_mulhi_epu16(y, div100), 3)));
-  __m128i big_endian_bcd =
-      _mm_add_epi16(z, _mm_mullo_epi16(neg10, _mm_mulhi_epu16(z, div10)));
-  __m128i bcd = _mm_shuffle_epi8(big_endian_bcd, bswap);  // SSSE3
-#  else
-  __m128i y = _mm_shuffle_epi32(y_shuffled, _MM_SHUFFLE(0, 1, 2, 3));
+  __m128i y = y_shuffled; //_mm_shuffle_epi32(y_shuffled, _MM_SHUFFLE(0, 1, 2, 3));
   __m128i y_div_100 = _mm_srli_epi16(_mm_mulhi_epu16(y, div100), 3);
+  __m128i gathered_div = _mm_shuffle_epi32(_mm_mask_i32gather_epi32(all_ones, (const int*)(digits2_data), y_div_100, all_ones, 4), _MM_SHUFFLE(0, 1, 2, 3));
   __m128i y_mod_100 = _mm_sub_epi16(y, _mm_mullo_epi16(y_div_100, hundred));
-  __m128i gathered_div = _mm_i32gather_epi32((const int*)(digits2_data + 2), y_div_100, 4);
-  __m128i gathered_mod = _mm_i32gather_epi32((const int*)(digits2_data), y_mod_100, 4);
-  //__m128i z = _mm_or_si128(_mm_slli_epi32(y_mod_100, 16), y_div_100);
-  __m128i digits = _mm_or_si128(gathered_div, gathered_mod);
-  //__m128i digits = _mm_shuffle_epi8(digits_shuffled, _mm_setr_epi8(6, 7, 14, 15, 4, 5, 12, 13, 2, 3, 10, 11, 0, 1, 8, 9)); //_mm_shuffle_epi32(digits_shuffled, _MM_SHUFFLE(0, 1, 2, 3));
-  //__m128i bcd_shuffled =
-  //    _mm_sub_epi16(_mm_slli_epi16(z, 8),
-  //                  _mm_mullo_epi16(moddiv10, _mm_mulhi_epu16(z, div10)));
-#  endif  // ZMIJ_USE_SSE4_1
+  __m128i gathered_mod = _mm_shuffle_epi32(_mm_mask_i32gather_epi32(all_ones, (const int*)(digits2_data), y_mod_100, all_ones, 4), _MM_SHUFFLE(0, 1, 2, 3));
+  __m128i digits = _mm_blend_epi16(gathered_div, gathered_mod, 0xaa);
 
   //auto digits = _mm_or_si128(bcd, zeros);
   //auto digits_flagged = _mm_shuffle_epi8(tbl_digits, bcd);
