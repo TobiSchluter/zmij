@@ -735,12 +735,16 @@ ZMIJ_INLINE auto write_significand(char* buffer, uint64_t value,
       x, _mm_mul_epu32(neg10k,
                        _mm_srli_epi64(_mm_mul_epu32(x, div10k), div10k_exp)));
 #  if ZMIJ_USE_SSE4_1
-  // _mm_mullo_epi32 is SSE 4.1
-  __m128i z = _mm_add_epi64(
-      y,
-      _mm_mullo_epi32(neg100, _mm_srli_epi32(_mm_mulhi_epu16(y, div100), 3)));
-  __m128i big_endian_bcd =
-      _mm_add_epi16(z, _mm_mullo_epi16(neg10, _mm_mulhi_epu16(z, div10)));
+  // SSSE3 in fact
+  __m128i y_div_100 = _mm_srli_epi16(_mm_mulhi_epu16(y, div100), 3);
+  __m128i rhs = _mm_or_si128(_mm_slli_epi32(y_div_100, 17), y);
+  __m128i lhs = _mm_set1_epi32((((1 << 15) - 50) << 16) + (1));
+  __m128i z = _mm_madd_epi16(lhs, rhs);
+
+  __m128i z_div_10 = _mm_mulhi_epu16(z, div10);
+  __m128i Lhs = _mm_set1_epi16((((1 << 8) - 10)) + (1 << 8));
+  __m128i Rhs = _mm_or_si128(z_div_10, _mm_slli_epi16(z, 8));
+  __m128i big_endian_bcd = _mm_maddubs_epi16(Lhs, Rhs);
   __m128i bcd = _mm_shuffle_epi8(big_endian_bcd, bswap);  // SSSE3
 #  else   // !ZMIJ_USE_SSE4_1
   __m128i y_div_100 = _mm_srli_epi16(_mm_mulhi_epu16(y, div100), 3);
