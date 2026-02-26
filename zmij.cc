@@ -52,14 +52,14 @@ struct dec_fp {
 #  include <immintrin.h>
 #endif
 
-#ifdef ZMIJ_USE_SSE4_1
+#ifdef ZMIJ_USE_SSSE3
 // Use the provided definition
-static_assert(!ZMIJ_USE_SSE4_1 || ZMIJ_USE_SSE);
-#elif defined(__SSE4_1__) || defined(__AVX__)
-// On MSVC there's no way to check for SSE4.1 specifically so check __AVX__.
-#  define ZMIJ_USE_SSE4_1 ZMIJ_USE_SSE
+static_assert(!ZMIJ_USE_SSSE3 || ZMIJ_USE_SSE);
+#elif defined(__SSSE3__) || defined(__AVX__)
+// On MSVC there's no way to check for SSSE3 specifically so check __AVX__.
+#  define ZMIJ_USE_SSSE3 ZMIJ_USE_SSE
 #else
-#  define ZMIJ_USE_SSE4_1 0
+#  define ZMIJ_USE_SSSE3 0
 #endif
 
 #ifdef __aarch64__
@@ -702,7 +702,7 @@ ZMIJ_INLINE auto write_significand(char* buffer, uint64_t value,
     uint128 div100 = splat32(div100_sig);
     uint128 div10 = splat16((1 << 16) / 10 + 1);
     uint128 moddiv10 = splat16(10 * (1 << 8) - 1);
-#  if ZMIJ_USE_SSE4_1
+#  if ZMIJ_USE_SSSE3
     uint128 bcdswap = uint128{pack8(6, 7, 4, 5, 2, 3, 0, 1),
                               pack8(14, 15, 12, 13, 10, 11, 8, 9)};
 #  endif
@@ -718,7 +718,7 @@ ZMIJ_INLINE auto write_significand(char* buffer, uint64_t value,
   const __m128i div100 = _mm_load_si128(ptr(&c->div100));
   const __m128i div10 = _mm_load_si128(ptr(&c->div10));
   const __m128i moddiv10 = _mm_load_si128(ptr(&c->moddiv10));
-#  if ZMIJ_USE_SSE4_1
+#  if ZMIJ_USE_SSSE3
   const __m128i bcdswap = _mm_load_si128(ptr(&c->bcdswap));
 #  endif
   const __m128i zeros = _mm_load_si128(ptr(&c->zeros));
@@ -736,13 +736,13 @@ ZMIJ_INLINE auto write_significand(char* buffer, uint64_t value,
   __m128i swapped_bcd =
       _mm_sub_epi16(_mm_slli_epi16(z, 8),
                     _mm_mullo_epi16(moddiv10, _mm_mulhi_epu16(z, div10)));
-#  if ZMIJ_USE_SSE4_1
+#  if ZMIJ_USE_SSSE3
   // SSSE3 in fact
   __m128i bcd = _mm_shuffle_epi8(swapped_bcd, bcdswap);  // SSSE3
-#  else   // !ZMIJ_USE_SSE4_1
+#  else   // !ZMIJ_USE_SSSE3
   __m128i bcd = _mm_shufflehi_epi16(
       _mm_shufflelo_epi16(swapped_bcd, _MM_SHUFFLE(0, 1, 2, 3)), _MM_SHUFFLE(0, 1, 2, 3));
-#  endif  // ZMIJ_USE_SSE4_1
+#  endif  // ZMIJ_USE_SSSE3
 
   auto digits = _mm_or_si128(bcd, zeros);
 
