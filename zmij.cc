@@ -696,6 +696,7 @@ ZMIJ_INLINE auto write_significand(char* buffer, uint64_t value,
              u64(d) << 24 | u64(c) << 16 | u64(b) << +8 | u64(a);
     }
 
+    uint128 maxint8 = splat16(0x7f7f);
     uint128 div10k = splat64(div10k_sig);
     uint128 neg10k = splat64(::neg10k);
     uint128 div100 = splat32(div100_sig);
@@ -715,6 +716,7 @@ ZMIJ_INLINE auto write_significand(char* buffer, uint64_t value,
   ZMIJ_ASM(("" : "+r"(c)));  // Load constants from memory.
 
   using ptr = const __m128i*;
+  const __m128i maxint8 = _mm_load_si128(ptr(&c->maxint8));
   const __m128i div10k = _mm_load_si128(ptr(&c->div10k));
   const __m128i neg10k = _mm_load_si128(ptr(&c->neg10k));
   const __m128i div100 = _mm_load_si128(ptr(&c->div100));
@@ -759,7 +761,7 @@ ZMIJ_INLINE auto write_significand(char* buffer, uint64_t value,
   auto digits = _mm_or_si128(bcd, zeros);
 
   // Count leading zeros.
-  __m128i mask128 = _mm_cmpgt_epi8(bcd, _mm_setzero_si128());
+  __m128i mask128 = _mm_add_epi8(maxint8, bcd);
   uint64_t mask = _mm_movemask_epi8(mask128);
 #  if defined(__LZCNT__) && !defined(ZMIJ_NO_BUILTINS)
   auto len = 32 - _lzcnt_u32(mask);
