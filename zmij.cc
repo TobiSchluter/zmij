@@ -994,8 +994,6 @@ constexpr uint128 double_sse4_shuffle_table[17] = {
 
 auto write_fixed_double_sse4(char* buffer, uint64_t dec_sig, int dec_exp,
                              bool extra_digit) noexcept -> char* {
-  char* start = buffer;
-
   uint32_t abbccddee = uint32_t(dec_sig / 100'000'000);
   uint32_t ffgghhii = uint32_t(dec_sig % 100'000'000);
   uint32_t a = abbccddee / 100'000'000;
@@ -1028,10 +1026,10 @@ auto write_fixed_double_sse4(char* buffer, uint64_t dec_sig, int dec_exp,
   _mm_storeu_si128(reinterpret_cast<__m128i*>(buffer), digits);
   // only the byte at buffer + 16 is actually needed
   buffer[16] =  (char)_mm_cvtsi128_si64(unshuffled_digits);
-  buffer += len;
 
-  char* point = start + dec_exp + 1;
+  char* point = buffer + dec_exp + !extra_digit;
   *point = '.';
+  buffer += len;
   return buffer > point ? buffer + 1 : point;
 }
 #endif
