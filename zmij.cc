@@ -1004,7 +1004,6 @@ auto write_fixed_double_sse4(char* buffer, uint64_t dec_sig, int dec_exp,
 
   const auto* c = &sse_consts;
   ZMIJ_ASM(("" : "+r"(c)));  // Load constants from memory.
-  const __m128i bswap = _mm_load_si128((const __m128i*)(&c->bswap));
   const __m128i zeros = _mm_load_si128((const __m128i*)(&c->zeros));
   const __m128i dots = _mm_load_si128((const __m128i*)(&c->dots));
 
