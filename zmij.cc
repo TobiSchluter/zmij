@@ -594,7 +594,9 @@ alignas(64) static constexpr struct sse_constants {
   uint128 neg10 = splat16((1 << 8) - 10);
   uint128 bswap = uint128{pack8(15, 14, 13, 12, 11, 10, 9, 8),
                           pack8(7, 6, 5, 4, 3, 2, 1, 0)};
+#    if !ZMIJ_OPTIMIZE_SIZE
   uint128 dots = splat16(('.' << 8) + '.');
+#    endif
 #  else
   uint128 hundred = splat32(100);
   uint128 moddiv10 = splat16(10 * (1 << 8) - 1);
