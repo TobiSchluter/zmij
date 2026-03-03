@@ -594,6 +594,7 @@ alignas(64) static constexpr struct sse_constants {
   uint128 neg10 = splat16((1 << 8) - 10);
   uint128 bswap = uint128{pack8(15, 14, 13, 12, 11, 10, 9, 8),
                           pack8(7, 6, 5, 4, 3, 2, 1, 0)};
+  uint128 dots = splat16(('.' << 8) + '.');
 #  else
   uint128 hundred = splat32(100);
   uint128 moddiv10 = splat16(10 * (1 << 8) - 1);
@@ -1005,14 +1006,10 @@ auto write_fixed_double_sse4(char* buffer, uint64_t dec_sig, int dec_exp,
   ZMIJ_ASM(("" : "+r"(c)));  // Load constants from memory.
   const __m128i bswap = _mm_load_si128((const __m128i*)(&c->bswap));
   const __m128i zeros = _mm_load_si128((const __m128i*)(&c->zeros));
+  const __m128i dots = _mm_load_si128((const __m128i*)(&c->dots));
 
   auto unshuffled_bcd = get_double_significand_bcd_unshuffled_sse(
       dec_sig, extra_digit, bbccddee, ffgghhii, c);
-  auto unshuffled_digits = _mm_or_si128(unshuffled_bcd, zeros);
-  const __m128i shuffler = _mm_load_si128(
-      (const __m128i*)&double_sse4_shuffle_table[dec_exp + !extra_digit]);
-  auto digits = _mm_shuffle_epi8(unshuffled_digits,
-                                 shuffler);  // SSSE3 for _mm_shuffle_epi8
 
   // Count trailing zeros.
   __m128i mask128 = _mm_cmpgt_epi8(unshuffled_bcd, _mm_setzero_si128());
@@ -1023,12 +1020,16 @@ auto write_fixed_double_sse4(char* buffer, uint64_t dec_sig, int dec_exp,
   auto len = 16 - ctz32(mask);
 #  endif
 
-  _mm_storeu_si128(reinterpret_cast<__m128i*>(buffer), digits);
-  // only the byte at buffer + 16 is actually needed
+  auto unshuffled_digits = _mm_or_si128(unshuffled_bcd, zeros);
+  const __m128i shuffler = _mm_load_si128(
+      (const __m128i*)&double_sse4_shuffle_table[dec_exp + !extra_digit]);
+  auto digits = _mm_shuffle_epi8(unshuffled_digits, shuffler);
+  auto digits_with_dot = _mm_blendv_epi8(digits, dots, shuffler);
+
+  _mm_storeu_si128(reinterpret_cast<__m128i*>(buffer), digits_with_dot);
   buffer[16] =  (char)_mm_cvtsi128_si64(unshuffled_digits);
 
   char* point = buffer + dec_exp + !extra_digit;
-  *point = '.';
   buffer += len;
   return buffer > point ? buffer + 1 : point;
 }
