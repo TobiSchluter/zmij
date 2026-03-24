@@ -220,8 +220,9 @@ ZMIJ_INLINE auto select_if_less(uint64_t lhs, uint64_t rhs, int64_t true_value,
   ZMIJ_ASM(
       volatile("cmp %3, %2\n\t"
                "cmovb %1, %0\n\t"  //
-               : "+r"(false_value) : "r"(true_value),
-               "r"(lhs), "r"(rhs) : "cc"));
+               : "+r"(false_value)
+               : "r"(true_value), "r"(lhs), "r"(rhs)
+               : "cc"));
   return false_value;
 }
 
@@ -294,8 +295,8 @@ constexpr auto umul128_hi64(uint64_t x, uint64_t y) noexcept -> uint64_t {
   return uint64_t(umul128(x, y) >> 64);
 }
 
-inline auto umul192_hi128(uint64_t x_hi, uint64_t x_lo, uint64_t y) noexcept
-    -> uint128 {
+inline auto umul192_hi128(uint64_t x_hi, uint64_t x_lo,
+                          uint64_t y) noexcept -> uint128 {
   uint128_t p = umul128(x_hi, y);
   uint64_t lo = uint64_t(p) + uint64_t(umul128(x_lo, y) >> 64);
   return {uint64_t(p >> 64) + (lo < uint64_t(p)), lo};
@@ -303,21 +304,21 @@ inline auto umul192_hi128(uint64_t x_hi, uint64_t x_lo, uint64_t y) noexcept
 
 // Computes high 64 bits of multiplication of x and y, discards the least
 // significant bit and rounds to odd, where x = uint128_t(x_hi << 64) | x_lo.
-auto umulhi_inexact_to_odd(uint64_t x_hi, uint64_t x_lo, uint64_t y) noexcept
-    -> uint64_t {
+auto umulhi_inexact_to_odd(uint64_t x_hi, uint64_t x_lo,
+                           uint64_t y) noexcept -> uint64_t {
   uint128 p = umul192_hi128(x_hi, x_lo, y);
   return p.hi | ((p.lo >> 1) != 0);
 }
-auto umulhi_inexact_to_odd(uint64_t x_hi, uint64_t, uint32_t y) noexcept
-    -> uint32_t {
+auto umulhi_inexact_to_odd(uint64_t x_hi, uint64_t,
+                           uint32_t y) noexcept -> uint32_t {
   uint64_t p = uint64_t(umul128(x_hi, y) >> 32);
   return uint32_t(p >> 32) | ((uint32_t(p) >> 1) != 0);
 }
 
 // Computes the decimal exponent as floor(log10(2**bin_exp)) if regular or
 // floor(log10(3/4 * 2**bin_exp)) otherwise, without branching.
-constexpr auto compute_dec_exp(int bin_exp, bool regular = true) noexcept
-    -> int {
+constexpr auto compute_dec_exp(int bin_exp,
+                               bool regular = true) noexcept -> int {
   assert(bin_exp >= -1334 && bin_exp <= 2620);
   // log10_3_over_4_sig = -log10(3/4) * 2**log10_2_exp rounded to a power of 2
   constexpr int log10_3_over_4_sig = 131'072;
@@ -638,8 +639,8 @@ auto to_bcd8(uint64_t abcdefgh) noexcept -> uint64_t {
   return is_big_endian ? a_b_c_d_e_f_g_h : bswap64(a_b_c_d_e_f_g_h);
 }
 
-inline auto write_if(char* buffer, uint32_t digit, bool condition) noexcept
-    -> char* {
+inline auto write_if(char* buffer, uint32_t digit,
+                     bool condition) noexcept -> char* {
   *buffer = char('0' + digit);
   return buffer + condition;
 }
@@ -654,8 +655,8 @@ alignas(64) constexpr struct sse_constants {
     return splat32(uint32_t(x) << 16 | x);
   }
   static constexpr auto pack8(uint8_t a, uint8_t b, uint8_t c, uint8_t d,  //
-                              uint8_t e, uint8_t f, uint8_t g, uint8_t h)
-      -> uint64_t {
+                              uint8_t e, uint8_t f, uint8_t g,
+                              uint8_t h) -> uint64_t {
     using u64 = uint64_t;
     return u64(h) << 56 | u64(g) << 48 | u64(f) << 40 | u64(e) << 32 |
            u64(d) << 24 | u64(c) << 16 | u64(b) << +8 | u64(a);
@@ -824,8 +825,7 @@ ZMIJ_INLINE auto to_digits(char* buffer, uint64_t value,
   ZMIJ_ASM(("" : "+r"(c)));  // Load constants from memory.
 
   const __m128i zeros = _mm_load_si128(m128ptr(&c->zeros));
-  auto unshuffled_bcd =
-      to_unshuffled_digits(abbccddee, ffgghhii, *c);
+  auto unshuffled_bcd = to_unshuffled_digits(abbccddee, ffgghhii, *c);
 #  if ZMIJ_USE_SSE4_1
   const __m128i bswap = _mm_load_si128(m128ptr(&c->bswap));
   auto bcd = _mm_shuffle_epi8(unshuffled_bcd, bswap);  // SSSE3
@@ -942,8 +942,7 @@ auto write_fixed_double_simd(char* buffer, uint64_t dec_sig, int dec_exp,
   ZMIJ_ASM(("" : "+r"(c)));  // Load constants from memory.
   __m128i zeros = _mm_load_si128(m128ptr(&c->zeros));
 
-  auto reversed_bcd =
-      to_unshuffled_digits(bbccddee, ffgghhii, *c);
+  auto reversed_bcd = to_unshuffled_digits(bbccddee, ffgghhii, *c);
 
   // Count trailing zeros.
   __m128i mask128 = _mm_cmpgt_epi8(reversed_bcd, _mm_setzero_si128());
@@ -954,9 +953,11 @@ auto write_fixed_double_simd(char* buffer, uint64_t dec_sig, int dec_exp,
   len = 16 - ctz(mask);
 #  endif
 
-  __m128i shuffler = _mm_load_si128(m128ptr(shuffles.get_shuffler(point_index)));
+  __m128i shuffler =
+      _mm_load_si128(m128ptr(shuffles.get_shuffler(point_index)));
   __m128i bcd = _mm_shuffle_epi8(reversed_bcd, shuffler);  // SSSE3
-  __m128i point_mask = _mm_load_si128(m128ptr(shuffles.get_point_and_zeros(point_index)));
+  __m128i point_mask =
+      _mm_load_si128(m128ptr(shuffles.get_point_and_zeros(point_index)));
   __m128i digits_with_point = _mm_or_si128(bcd, point_mask);
 
   // Write 20 bytes non-overlappingly.
@@ -974,9 +975,8 @@ struct to_decimal_result {
 };
 
 template <typename UInt>
-ZMIJ_INLINE auto to_decimal_schubfach(UInt bin_sig, int64_t bin_exp,
-                                      bool regular) noexcept
-    -> to_decimal_result {
+ZMIJ_INLINE auto to_decimal_schubfach(
+    UInt bin_sig, int64_t bin_exp, bool regular) noexcept -> to_decimal_result {
   constexpr int num_bits = std::numeric_limits<UInt>::digits;
   int dec_exp = compute_dec_exp(bin_exp, regular);
   unsigned char exp_shift = compute_exp_shift(bin_exp, dec_exp);
