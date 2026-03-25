@@ -203,9 +203,13 @@ inline auto ctz(uint64_t x) noexcept -> int {
 #if ZMIJ_HAS_BUILTIN(__builtin_ctzll)
   return __builtin_ctzll(x);
 #elif ZMIJ_MSC_VER
+#  if defined(__BMI1__)
+  return _tzcnt_u64(mask);
+#  else
   unsigned long r;
   _BitScanForward64(&r, x);
   return r;
+#  endif
 #else
   int n = 0;
   for (; (x & 1) == 0; x >>= 1) ++n;
@@ -947,11 +951,7 @@ auto write_fixed_double_simd(char* buffer, uint64_t dec_sig, int dec_exp,
   // Count trailing zeros.
   __m128i mask128 = _mm_cmpgt_epi8(reversed_bcd, _mm_setzero_si128());
   uint32_t mask = _mm_movemask_epi8(mask128) | (1u << 16);
-#  if defined(__BMI1__) && !defined(ZMIJ_NO_BUILTINS)
-  len = 16 - _tzcnt_u32(mask);
-#  else
   len = 16 - ctz(mask);
-#  endif
 
   __m128i shuffler =
       _mm_load_si128(m128ptr(shuffles.get_shuffler(point_index)));
