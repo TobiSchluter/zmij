@@ -532,7 +532,7 @@ struct exp_string_table {
       uint64_t bc = abs_e % 100;
       uint64_t val = ((bc % 10 + '0') << 8) | (bc / 10 + '0');
       if (uint64_t a = abs_e / 100) val = (val << 8) | (a + '0');
-      uint64_t len = 4 + (abs_e >= 100);
+      uint64_t len = e < traits::min_fixed_dec_exp || e > traits::max_fixed_dec_exp ? 4 + (abs_e >= 100) : 0;
       data[e + offset] =
           (len << 48) | (val << 16) | (uint64_t(e >= 0 ? '+' : '-') << 8) | 'e';
     }
@@ -556,9 +556,35 @@ struct fixed_layout_table {
     // Offset past the end of fixed-notation output, indexed by sig length - 1.
     unsigned char end_pos[traits::max_digits10];
   };
-  entry data[num_entries] = {};
+  //entry data[num_entries] = {};
+
+  static constexpr int min_dec_exp =
+      traits::min_exponent10 - traits::max_digits10;
+  entry data[traits::max_exponent10 - min_dec_exp + 1] = {};
 
   constexpr fixed_layout_table() {
+    for (int dec_exp = min_dec_exp; dec_exp <= traits::max_exponent10; ++dec_exp) {
+      auto& e = data[dec_exp - min_dec_exp];
+      if (dec_exp >= traits::min_fixed_dec_exp && dec_exp <= traits::max_fixed_dec_exp) {
+        e.start_pos = dec_exp < 0 ? 1 - dec_exp : 0;
+        e.point_pos = dec_exp >= 0 ? 1 + dec_exp : 1;
+        e.shift_pos = e.point_pos + (dec_exp >= 0);
+
+        for (int n = 1; n <= traits::max_digits10; ++n) {
+          int end_pos = n;
+          if (dec_exp >= 0) end_pos = n > dec_exp + 1 ? n + 1 : dec_exp + 1;
+          e.end_pos[n - 1] = end_pos;
+        }
+      } else {
+        e.start_pos = 0;
+        e.point_pos = 1;
+        e.shift_pos = 2;
+        for (int n = 1; n <= traits::max_digits10; ++n) {
+          e.end_pos[n - 1] = n + (n > 1);
+        }
+      }
+    }
+    return;
     for (int dec_exp = traits::min_fixed_dec_exp;
          dec_exp <= traits::max_fixed_dec_exp; ++dec_exp) {
       auto& e = data[dec_exp - traits::min_fixed_dec_exp];
@@ -576,6 +602,8 @@ struct fixed_layout_table {
   }
 
   constexpr auto get(int dec_exp) const noexcept -> const entry& {
+    return data[dec_exp - min_dec_exp];
+
     constexpr auto min = traits::min_fixed_dec_exp;
     assert(dec_exp >= min && dec_exp <= traits::max_fixed_dec_exp);
     return data[unsigned(dec_exp - min)];
@@ -1100,28 +1128,19 @@ auto write(Float value, char* buffer) noexcept -> char* {
   char* start = buffer;
   auto dig = to_digits<traits::num_bits>(dec.sig, *c);
   constexpr int bcd_size = traits::num_bits == 64 ? 16 : 8;
-  if (dec_exp >= traits::min_fixed_dec_exp &&
-      dec_exp <= traits::max_fixed_dec_exp) {
-    memcpy(start, &zeros, 8);  // For dec_exp < 0.
-    const auto& layout = c->fixed_layouts.get(dec_exp);
-    buffer += layout.start_pos;
-    memcpy(buffer, &dig.digits, bcd_size);
-    memmove(buffer, buffer + !extra_digit, bcd_size);  // Cheap on aarch64.
-    buffer[bcd_size + extra_digit - 1] =
-        '0' + (-has_last_digit & dec.last_digit);
-    memmove(start + layout.shift_pos, start + layout.point_pos, bcd_size);
-    start[layout.point_pos] = '.';
-    int num_digits = has_last_digit ? bcd_size : dig.num_digits - 1;
-    return buffer + layout.end_pos[num_digits + extra_digit - 1];
-  }
-  buffer += extra_digit;
-  memcpy(buffer, &dig.digits, bcd_size);
-  buffer[bcd_size] = '0' + dec.last_digit;
-  buffer += has_last_digit ? bcd_size + 1 : dig.num_digits;
-  start[0] = start[1];
-  start[1] = '.';
-  buffer -= (buffer - 1 == start + 1);  // Remove trailing point.
 
+  memcpy(start, &zeros, 8);  // For dec_exp < 0 and fixed format
+  const auto& layout = c->fixed_layouts.get(dec_exp);
+  buffer += layout.start_pos;
+  memcpy(buffer, &dig.digits, bcd_size);
+  memmove(buffer, buffer + !extra_digit, bcd_size);  // Cheap on aarch64.
+  buffer[bcd_size + extra_digit - 1] =
+      '0' + (-has_last_digit & dec.last_digit);
+  memmove(start + layout.shift_pos, start + layout.point_pos, bcd_size);
+  start[layout.point_pos] = '.';
+  int num_digits = has_last_digit ? bcd_size : dig.num_digits - 1;
+  buffer += layout.end_pos[num_digits + extra_digit - 1];
+  
   // Write exponent.
   if (exp_string_table::enable) {
     uint64_t exp_data = c->exp_strings.data[dec_exp + exp_string_table::offset];

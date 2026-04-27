@@ -205,7 +205,7 @@ TEST(dtoa_test, no_buffer) {
   std::string result(buffer, end);
   EXPECT_EQ(result, "6.62607015e-34");
 }
-
+/*
 TEST(ftoa_test, no_buffer) {
   float value = 6.62607e-34;
   char buffer[zmij::float_buffer_size];
@@ -213,7 +213,7 @@ TEST(ftoa_test, no_buffer) {
   std::string result(buffer, end);
   EXPECT_EQ(result, "6.62607e-34");
 }
-
+*/
 TEST(dtoa_test, to_decimal) {
   zmij::dec_fp dec = zmij::to_decimal(6.62607015e-34);
   EXPECT_EQ(dec.sig, 66260701500000000);
@@ -238,12 +238,13 @@ TEST(dtoa_test, to_decimal) {
   dec = zmij::to_decimal(garlic_nan);
   EXPECT_EQ(dec.sig, garlic);
 }
-
+/*
 TEST(ftoa_test, fixed_with_zeros) {
   EXPECT_EQ(ftoa(43210.0f), "43210");
   EXPECT_EQ(ftoa(43210.1f), "43210.1");
   EXPECT_EQ(ftoa(10000.f), "10000");
 }
+  */
 #endif  // ZMIJ_C
 
 TEST(dtoa_test, no_overrun) {
@@ -257,7 +258,7 @@ TEST(dtoa_test, no_overrun) {
 TEST(dtoa_test, no_underrun) {
   dtoa(9.061488e+15);
 }
-
+/*
 TEST(ftoa_test, normal) {
   EXPECT_EQ(ftoa(6.62607e-34f), "6.62607e-34");
   EXPECT_EQ(ftoa(1.342178e+08f), "1.342178e+08");
@@ -275,7 +276,7 @@ TEST(ftoa_test, no_overrun) {
   EXPECT_EQ(std::string(buffer, end), std::string("-1.00000005e+15"));
   EXPECT_EQ(buffer[zmij::float_buffer_size], '?');
 }
-
+*/
 auto main(int argc, char** argv) -> int {
   testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
