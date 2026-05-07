@@ -562,6 +562,11 @@ struct fixed_layout_table {
     unsigned char last_digit_pos[2];
     // Offset past the end of fixed-notation output, indexed by sig length - 1.
     unsigned char end_pos[traits::max_digits10];
+    // Extra offset added to bswap_base for the merged shuffle of the SIMD
+    // shifted store. Zero for dec_exp < 0, in which case the shifted store
+    // collapses onto the first store (same shuffle, same destination, written
+    // twice but harmless) and the runtime branch goes away.
+    unsigned char shift_extra;
   };
   entry data[num_entries] = {};
 
@@ -586,6 +591,8 @@ struct fixed_layout_table {
         if (dec_exp >= 0) end_pos = n > dec_exp + 1 ? n + 1 : dec_exp + 1;
         e.end_pos[n - 1] = end_pos;
       }
+
+      e.shift_extra = dec_exp >= 0 ? e.point_pos : 0;
     }
   }
 
@@ -1182,20 +1189,16 @@ auto write(Float value, char* buffer) noexcept -> char* {
           reinterpret_cast<const __m128i*>(bswap_base));
       _mm_storeu_si128(reinterpret_cast<__m128i*>(buffer),
                        _mm_shuffle_epi8(dig.digits, bswap));
-      // Same offset trick, just shifted by point_pos: indices past 0xF map
-      // into div10k whose first two bytes have the high bit set, giving 0
-      // for don't-care lanes. Visible-output lanes never reach further.
-      // Compute unconditionally so the load + pshufb can issue alongside the
-      // branch decision; only the store is gated. dec_exp < 0 must skip the
-      // store - the memmove it stands in for is a no-op (shift_pos ==
-      // point_pos), and storing here would clobber leading zeros since
-      // start_pos > 1.
+      // Second store: same offset trick, shifted by layout.shift_extra. For
+      // dec_exp < 0 shift_extra == 0, so the shuffle and destination match
+      // the first store - this redundantly rewrites the same bytes instead
+      // of branching. The +(shift_extra != 0) compiles to a setcc, no jump.
+      unsigned shift_extra = layout.shift_extra;
       __m128i merged = _mm_loadu_si128(
-          reinterpret_cast<const __m128i*>(bswap_base + point_pos));
-      __m128i shifted = _mm_shuffle_epi8(dig.digits, merged);
-      if (dec_exp >= 0)
-        _mm_storeu_si128(reinterpret_cast<__m128i*>(start + shift_pos),
-                         shifted);
+          reinterpret_cast<const __m128i*>(bswap_base + shift_extra));
+      _mm_storeu_si128(
+          reinterpret_cast<__m128i*>(buffer + shift_extra + (shift_extra != 0)),
+          _mm_shuffle_epi8(dig.digits, merged));
     } else
 #endif
     {
