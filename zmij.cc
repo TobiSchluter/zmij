@@ -559,6 +559,7 @@ struct fixed_layout_table {
     // indexed by extra_digit. Precomputed so the last_digit write can run
     // after the memmove without branching on whether its slot fell inside
     // the memmove source range (which differs for dec_exp == max_fixed_dec_exp).
+    // This is only for bcd_size == 16, i.e. doubles.
     unsigned char last_digit_pos[2];
     // Offset past the end of fixed-notation output, indexed by sig length - 1.
     unsigned char end_pos[traits::max_digits10];
@@ -1199,13 +1200,17 @@ auto write(Float value, char* buffer) noexcept -> char* {
       _mm_storeu_si128(
           reinterpret_cast<__m128i*>(buffer + shift_extra + (shift_extra != 0)),
           _mm_shuffle_epi8(dig.digits, merged));
+      // last_digit_pos is baked with bcd_size = 16; this branch only fires
+      // when bcd_size == 16, so it's safe here. The fallback below uses the
+      // original pre-memmove write to stay correct for float (bcd_size = 8).
+      buffer[layout.last_digit_pos[extra_digit]] = last_digit;
     } else
 #endif
     {
       write_digits(buffer, dig.digits, !extra_digit, *d);
+      buffer[bcd_size + extra_digit - 1] = last_digit;
       memmove(start + shift_pos, start + point_pos, bcd_size);
     }
-    buffer[layout.last_digit_pos[extra_digit]] = last_digit;
     start[point_pos] = '.';
     return buffer + layout.end_pos[num_digits + extra_digit - 1];
   }
