@@ -556,16 +556,12 @@ struct fixed_layout_table {
     // Start position for shifting digits right by one to insert the point.
     unsigned char shift_pos;
     // Buffer-relative position of the last_digit byte after the memmove,
-    // indexed by extra_digit. Lets the runtime write last_digit *after* the
-    // memmove without recomputing whether its slot fell inside the memmove
-    // source range (which differs for dec_exp == max_fixed_dec_exp).
+    // indexed by extra_digit. Precomputed so the last_digit write can run
+    // after the memmove without branching on whether its slot fell inside
+    // the memmove source range (which differs for dec_exp == max_fixed_dec_exp).
     unsigned char last_digit_pos[2];
     // Offset past the end of fixed-notation output, indexed by sig length - 1.
     unsigned char end_pos[traits::max_digits10];
-    // SSE4.1 pshufb indices for the post-write_digits shift-by-1: replaces the
-    // overlapping memmove. shuffle[i] = point_pos + i for valid indices, else
-    // 0x80 to make pshufb write zero. Only consulted when dec_exp >= 0.
-    unsigned char shift_shuffle[16];
   };
   entry data[num_entries] = {};
 
@@ -589,11 +585,6 @@ struct fixed_layout_table {
         int end_pos = n;
         if (dec_exp >= 0) end_pos = n > dec_exp + 1 ? n + 1 : dec_exp + 1;
         e.end_pos[n - 1] = end_pos;
-      }
-
-      for (int i = 0; i < bcd_size; ++i) {
-        int idx = e.point_pos + i;
-        e.shift_shuffle[i] = idx < bcd_size ? idx : 0x80;
       }
     }
   }
@@ -1183,22 +1174,28 @@ auto write(Float value, char* buffer) noexcept -> char* {
     unsigned shift_pos = layout.shift_pos;
 #if ZMIJ_USE_SSE4_1
     if constexpr (bcd_size == 16) {
-      // Inline write_digits for SSE4.1 so R stays in a register and we can
-      // reuse it for the shifted store via pshufb instead of going through
-      // memmove (which would suffer a partially-overlapping store-forward
-      // stall).
-      __m128i bswap = _mm_loadu_si128(reinterpret_cast<const __m128i*>(
-          (const char*)&d->bswap + !extra_digit));
-      __m128i R = _mm_shuffle_epi8(dig.digits, bswap);
-      _mm_storeu_si128(reinterpret_cast<__m128i*>(buffer), R);
-      // For dec_exp < 0 the memmove is a no-op (shift_pos == point_pos) and
-      // start_pos > 1, so a SIMD shifted store would clobber leading zeros.
-      if (dec_exp >= 0) {
-        __m128i shift_shuffle = _mm_loadu_si128(
-            reinterpret_cast<const __m128i*>(layout.shift_shuffle));
+      // Two pshufbs over dig.digits, each loading its shuffle table from
+      // d->bswap + offset. Both depend only on dig.digits, so they issue in
+      // parallel.
+      const char* bswap_base = (const char*)&d->bswap + !extra_digit;
+      __m128i bswap = _mm_loadu_si128(
+          reinterpret_cast<const __m128i*>(bswap_base));
+      _mm_storeu_si128(reinterpret_cast<__m128i*>(buffer),
+                       _mm_shuffle_epi8(dig.digits, bswap));
+      // Same offset trick, just shifted by point_pos: indices past 0xF map
+      // into div10k whose first two bytes have the high bit set, giving 0
+      // for don't-care lanes. Visible-output lanes never reach further.
+      // Compute unconditionally so the load + pshufb can issue alongside the
+      // branch decision; only the store is gated. dec_exp < 0 must skip the
+      // store - the memmove it stands in for is a no-op (shift_pos ==
+      // point_pos), and storing here would clobber leading zeros since
+      // start_pos > 1.
+      __m128i merged = _mm_loadu_si128(
+          reinterpret_cast<const __m128i*>(bswap_base + point_pos));
+      __m128i shifted = _mm_shuffle_epi8(dig.digits, merged);
+      if (dec_exp >= 0)
         _mm_storeu_si128(reinterpret_cast<__m128i*>(start + shift_pos),
-                         _mm_shuffle_epi8(R, shift_shuffle));
-      }
+                         shifted);
     } else
 #endif
     {
