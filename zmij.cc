@@ -555,24 +555,26 @@ struct fixed_layout_table {
     unsigned char point_pos;
     // Start position for shifting digits right by one to insert the point.
     unsigned char shift_pos;
+#if ZMIJ_USE_SSE4_1
     // Buffer-relative position of the last_digit byte after the memmove,
     // indexed by extra_digit. Precomputed so the last_digit write can run
     // after the memmove without branching on whether its slot fell inside
     // the memmove source range (which differs for dec_exp == max_fixed_dec_exp).
     // This is only for bcd_size == 16, i.e. doubles.
     unsigned char last_digit_pos[2];
-    // Offset past the end of fixed-notation output, indexed by sig length - 1.
-    unsigned char end_pos[traits::max_digits10];
     // Extra offset added to bswap_base for the merged shuffle of the SIMD
     // shifted store. Zero for dec_exp < 0, in which case the shifted store
     // collapses onto the first store (same shuffle, same destination, written
     // twice but harmless) and the runtime branch goes away.
     unsigned char shift_extra;
+#endif
+    // Offset past the end of fixed-notation output, indexed by sig length - 1.
+    unsigned char end_pos[traits::max_digits10];
   };
   entry data[num_entries] = {};
 
   constexpr fixed_layout_table() {
-    constexpr int bcd_size = 16;
+    [[maybe_unused]] constexpr int bcd_size = 16;
     for (int dec_exp = traits::min_fixed_dec_exp;
          dec_exp <= traits::max_fixed_dec_exp; ++dec_exp) {
       auto& e = data[dec_exp - traits::min_fixed_dec_exp];
@@ -581,11 +583,13 @@ struct fixed_layout_table {
       e.point_pos = dec_exp >= 0 ? 1 + dec_exp : 1;
       e.shift_pos = e.point_pos + (dec_exp >= 0);
 
+#if ZMIJ_USE_SSE4_1
       for (int extra = 0; extra < 2; ++extra) {
         int pre = bcd_size + extra - 1;
         e.last_digit_pos[extra] =
             pre + (pre >= e.point_pos ? e.shift_pos - e.point_pos : 0);
       }
+#endif
 
       for (int n = 1; n <= traits::max_digits10; ++n) {
         int end_pos = n;
@@ -593,7 +597,9 @@ struct fixed_layout_table {
         e.end_pos[n - 1] = end_pos;
       }
 
+#if ZMIJ_USE_SSE4_1
       e.shift_extra = dec_exp >= 0 ? e.point_pos : 0;
+#endif
     }
   }
 
@@ -718,12 +724,15 @@ struct data {
   exp_shift_table exp_shifts;
   exp_string_table exp_strings;
   alignas(64) pow10_significand_table pow10_significands;
-  // Shuffle indices for SIMD digit shift. Offset 0 = identity, offset 1 =
-  // shift left by 1 (drops the leading '0' of a 16-digit significand).
-  //unsigned char shift_shuffle[17] = {0, 1,  2,  3,  4,  5,  6,  7, 8,
-  //                                   9, 10, 11, 12, 13, 14, 15, 0};
-  //alignas(32) char shift_shuffle[17] = {15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0, -1};
   fixed_layout_table fixed_layouts;
+
+#if ZMIJ_USE_NEON
+  // Shuffle indices for NEON's write_digits. Offset 0 = identity, offset 1 =
+  // shift left by 1 (drops the leading '0' of a 16-digit significand).
+  // SSE4.1 uses the offset trick on d.bswap instead.
+  unsigned char shift_shuffle[17] = {0, 1,  2,  3,  4,  5,  6,  7, 8,
+                                     9, 10, 11, 12, 13, 14, 15, 0};
+#endif
 };
 alignas(64) constexpr data static_data;
 
@@ -1178,8 +1187,6 @@ auto write(Float value, char* buffer) noexcept -> char* {
 
     const auto& layout = fixed_layouts->get(dec_exp);
     buffer += layout.start_pos;
-    unsigned point_pos = layout.point_pos;
-    unsigned shift_pos = layout.shift_pos;
 #if ZMIJ_USE_SSE4_1
     if constexpr (bcd_size == 16) {
       // Two pshufbs over dig.digits, each loading its shuffle table from
@@ -1200,17 +1207,18 @@ auto write(Float value, char* buffer) noexcept -> char* {
       _mm_storeu_si128(
           reinterpret_cast<__m128i*>(buffer + shift_extra + (shift_extra != 0)),
           _mm_shuffle_epi8(dig.digits, merged));
-      // last_digit_pos is baked with bcd_size = 16; this branch only fires
-      // when bcd_size == 16, so it's safe here. The fallback below uses the
-      // original pre-memmove write to stay correct for float (bcd_size = 8).
+      // last_digit_pos is baked with bcd_size = 16, so it only applies here;
+      // the NEON / SSE2 / float fallback below keeps the original pre-memmove
+      // write to stay correct for float (bcd_size = 8) too.
       buffer[layout.last_digit_pos[extra_digit]] = last_digit;
-    } else
-#endif
-    {
-      write_digits(buffer, dig.digits, !extra_digit, *d);
-      buffer[bcd_size + extra_digit - 1] = last_digit;
-      memmove(start + shift_pos, start + point_pos, bcd_size);
+      start[layout.point_pos] = '.';
+      return buffer + layout.end_pos[num_digits + extra_digit - 1];
     }
+#endif
+    write_digits(buffer, dig.digits, !extra_digit, *d);
+    buffer[bcd_size + extra_digit - 1] = last_digit;
+    unsigned point_pos = layout.point_pos;
+    memmove(start + layout.shift_pos, start + point_pos, bcd_size);
     start[point_pos] = '.';
     return buffer + layout.end_pos[num_digits + extra_digit - 1];
   }
