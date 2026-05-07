@@ -555,12 +555,18 @@ struct fixed_layout_table {
     unsigned char point_pos;
     // Start position for shifting digits right by one to insert the point.
     unsigned char shift_pos;
+    // Buffer-relative position of the last_digit byte after the memmove,
+    // indexed by extra_digit. Lets the runtime write last_digit *after* the
+    // memmove without recomputing whether its slot fell inside the memmove
+    // source range (which differs for dec_exp == max_fixed_dec_exp).
+    unsigned char last_digit_pos[2];
     // Offset past the end of fixed-notation output, indexed by sig length - 1.
     unsigned char end_pos[traits::max_digits10];
   };
   entry data[num_entries] = {};
 
   constexpr fixed_layout_table() {
+    constexpr int bcd_size = 16;
     for (int dec_exp = traits::min_fixed_dec_exp;
          dec_exp <= traits::max_fixed_dec_exp; ++dec_exp) {
       auto& e = data[dec_exp - traits::min_fixed_dec_exp];
@@ -568,6 +574,12 @@ struct fixed_layout_table {
       e.start_pos = dec_exp < -0 ? 1 - dec_exp : 0;
       e.point_pos = dec_exp >= 0 ? 1 + dec_exp : 1;
       e.shift_pos = e.point_pos + (dec_exp >= 0);
+
+      for (int extra = 0; extra < 2; ++extra) {
+        int pre = bcd_size + extra - 1;
+        e.last_digit_pos[extra] =
+            pre + (pre >= e.point_pos ? e.shift_pos - e.point_pos : 0);
+      }
 
       for (int n = 1; n <= traits::max_digits10; ++n) {
         int end_pos = n;
@@ -577,10 +589,21 @@ struct fixed_layout_table {
     }
   }
 
+  struct entry_ref {
+    unsigned char start_pos;
+    unsigned char point_pos;
+    // Start position for shifting digits right by one to insert the point.
+    unsigned char shift_pos;
+    //unsigned char pad;
+    // Offset past the end of fixed-notation output, indexed by sig length - 1.
+    const unsigned char* end_pos;
+  };
   constexpr auto get(int dec_exp) const noexcept -> const entry& {
     constexpr auto min = traits::min_fixed_dec_exp;
     assert(dec_exp >= min && dec_exp <= traits::max_fixed_dec_exp);
-    return data[unsigned(dec_exp - min)];
+    const entry& res = data[unsigned(dec_exp - min)];
+    //return entry_ref{res.start_pos, res.point_pos, res.shift_pos, res.end_pos};
+    return res;
   }
 };
 
@@ -687,12 +710,12 @@ struct data {
   exp_shift_table exp_shifts;
   exp_string_table exp_strings;
   alignas(64) pow10_significand_table pow10_significands;
-  fixed_layout_table fixed_layouts;
-
   // Shuffle indices for SIMD digit shift. Offset 0 = identity, offset 1 =
   // shift left by 1 (drops the leading '0' of a 16-digit significand).
-  unsigned char shift_shuffle[17] = {0, 1,  2,  3,  4,  5,  6,  7, 8,
-                                     9, 10, 11, 12, 13, 14, 15, 0};
+  //unsigned char shift_shuffle[17] = {0, 1,  2,  3,  4,  5,  6,  7, 8,
+  //                                   9, 10, 11, 12, 13, 14, 15, 0};
+  //alignas(32) char shift_shuffle[17] = {15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0, -1};
+  fixed_layout_table fixed_layouts;
 };
 alignas(64) constexpr data static_data;
 
@@ -897,7 +920,8 @@ ZMIJ_INLINE auto to_digits(uint64_t value, const data& d) noexcept
   // Trailing zeros are in the low bits for SSE4.1, the high bits for SSE2.
   int len = ZMIJ_USE_SSE4_1 ? 16 - ctz(mask) : 64 - clz(mask);
 #  if ZMIJ_USE_SSE4_1
-  bcd = _mm_shuffle_epi8(bcd, _mm_load_si128(m128ptr(&d.bswap)));  // SSSE3
+  // remain shuffled ...
+  //bcd = _mm_shuffle_epi8(bcd, _mm_load_si128(m128ptr(&d.bswap)));  // SSSE3
 #  endif
   return {_mm_or_si128(bcd, zeros), len};
 #endif  // ZMIJ_USE_SSE
@@ -925,8 +949,12 @@ ZMIJ_INLINE void write_digits(char* buffer, dec_digits<64>::digits_type digits,
   uint8x16_t shifted = vqtbl1q_u8(vreinterpretq_u8_u16(digits), shuffle);
   vst1q_u8(reinterpret_cast<uint8_t*>(buffer), shifted);
 #elif ZMIJ_USE_SSE4_1
+  // Note that in the case of drop_leading_zero we read into the next
+  // member of the struct, but we don't care about the value in the last
+  // digit, it will be dropped.  We are not going to cross a cache line
+  // because d.bswap sits at the beginning of a cache line (offset 64).
   __m128i shuffle = _mm_loadu_si128(
-      reinterpret_cast<const __m128i*>(d.shift_shuffle + drop_leading_zero));
+      reinterpret_cast<const __m128i*>((char *)&d.bswap + drop_leading_zero));
   _mm_storeu_si128(reinterpret_cast<__m128i*>(buffer),
                    _mm_shuffle_epi8(digits, shuffle));
 #endif
@@ -1143,13 +1171,18 @@ auto write(Float value, char* buffer) noexcept -> char* {
     const auto& layout = fixed_layouts->get(dec_exp);
     buffer += layout.start_pos;
     write_digits(buffer, dig.digits, !extra_digit, *d);
-    buffer[bcd_size + extra_digit - 1] = last_digit;
     unsigned point_pos = layout.point_pos;
-    memmove(start + layout.shift_pos, start + point_pos, bcd_size);
+    unsigned shift_pos = layout.shift_pos;
+    memmove(start + shift_pos, start + point_pos, bcd_size);
+    buffer[layout.last_digit_pos[extra_digit]] = last_digit;
     start[point_pos] = '.';
     return buffer + layout.end_pos[num_digits + extra_digit - 1];
   }
   buffer += extra_digit;
+#if ZMIJ_USE_SSE4_1
+  if constexpr (bcd_size == 16)
+    dig.digits = _mm_shuffle_epi8(dig.digits, _mm_load_si128(m128ptr(&d->bswap)));
+#endif
   memcpy(buffer, &dig.digits, bcd_size);
   buffer[bcd_size] = '0' + dec.last_digit;
   buffer += select(has_last_digit, bcd_size + 1, dig.num_digits);
