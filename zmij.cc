@@ -710,8 +710,12 @@ struct data {
 #  if ZMIJ_USE_SSE4_1
   uint128 neg100 = splat32(::neg100);
   uint128 neg10 = splat16((1 << 8) - 10);
-  uint128 bswap = uint128{pack8(15, 14, 13, 12, 11, 10, 9, 8),
-                          pack8(7, 6, 5, 4, 3, 2, 1, 0)};
+  // We will read from bswap at offsets for fixed format output.  Accomodate
+  // the necessary offset calculations by using char*.
+  // This is at offset 64 into the structure, so we won't cross a cache line
+  // when reading, even with offsets.
+  alignas(16) char bswap[16] = {15, 14, 13, 12, 11, 10, 9,  8,
+                                7,  6,  5,  4,  3,  2,  1,  0};
 #  else
   uint128 hundred = splat32(100);
   uint128 moddiv10 = splat16(10 * (1 << 8) - 1);
@@ -971,7 +975,7 @@ ZMIJ_INLINE void write_digits(char* buffer, dec_digits<64>::digits_type digits,
   // digit, it will be dropped.  We are not going to cross a cache line
   // because d.bswap sits at the beginning of a cache line (offset 64).
   __m128i shuffle = _mm_loadu_si128(
-      reinterpret_cast<const __m128i*>((char *)&d.bswap + drop_leading_zero));
+      reinterpret_cast<const __m128i*>(d.bswap + drop_leading_zero));
   _mm_storeu_si128(reinterpret_cast<__m128i*>(buffer),
                    _mm_shuffle_epi8(digits, shuffle));
 #endif
@@ -1194,7 +1198,7 @@ auto write(Float value, char* buffer) noexcept -> char* {
       // Two pshufbs over dig.digits, each loading its shuffle table from
       // d->bswap + offset. Both depend only on dig.digits, so they issue in
       // parallel.
-      const char* bswap_base = (const char*)&d->bswap + !extra_digit;
+      const char* bswap_base = d->bswap + !extra_digit;
       __m128i bswap_shift = _mm_loadu_si128(
           reinterpret_cast<const __m128i*>(bswap_base));
       _mm_storeu_si128(reinterpret_cast<__m128i*>(buffer),
@@ -1229,7 +1233,7 @@ auto write(Float value, char* buffer) noexcept -> char* {
   if (bcd_size == 16) {
     // dig.digits is uint64_t for float, alias as __m128i to avoid a compiler error.
     auto& digits = reinterpret_cast<__m128i&>(dig.digits);
-    digits = _mm_shuffle_epi8(digits, _mm_load_si128(m128ptr(&d->bswap)));
+    digits = _mm_shuffle_epi8(digits, _mm_load_si128(m128ptr(d->bswap)));
   }
 #endif
   memcpy(buffer, &dig.digits, bcd_size);
