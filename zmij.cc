@@ -1188,25 +1188,27 @@ auto write(Float value, char* buffer) noexcept -> char* {
     const auto& layout = fixed_layouts->get(dec_exp);
     buffer += layout.start_pos;
 #if ZMIJ_USE_SSE4_1
-    if constexpr (bcd_size == 16) {
+    if (bcd_size == 16) {
+      // dig.digits is uint64_t for float, alias as __m128i to avoid a compiler error.
+      auto& digits = reinterpret_cast<const __m128i&>(dig.digits);
       // Two pshufbs over dig.digits, each loading its shuffle table from
       // d->bswap + offset. Both depend only on dig.digits, so they issue in
       // parallel.
       const char* bswap_base = (const char*)&d->bswap + !extra_digit;
-      __m128i bswap = _mm_loadu_si128(
+      __m128i bswap_shift = _mm_loadu_si128(
           reinterpret_cast<const __m128i*>(bswap_base));
       _mm_storeu_si128(reinterpret_cast<__m128i*>(buffer),
-                       _mm_shuffle_epi8(dig.digits, bswap));
+                       _mm_shuffle_epi8(digits, bswap_shift));
       // Second store: same offset trick, shifted by layout.shift_extra. For
       // dec_exp < 0 shift_extra == 0, so the shuffle and destination match
       // the first store - this redundantly rewrites the same bytes instead
       // of branching. The +(shift_extra != 0) compiles to a setcc, no jump.
       unsigned shift_extra = layout.shift_extra;
-      __m128i merged = _mm_loadu_si128(
+      __m128i bswap_shift2 = _mm_loadu_si128(
           reinterpret_cast<const __m128i*>(bswap_base + shift_extra));
       _mm_storeu_si128(
           reinterpret_cast<__m128i*>(buffer + shift_extra + (shift_extra != 0)),
-          _mm_shuffle_epi8(dig.digits, merged));
+          _mm_shuffle_epi8(digits, bswap_shift2));
       // last_digit_pos is baked with bcd_size = 16, so it only applies here;
       // the NEON / SSE2 / float fallback below keeps the original pre-memmove
       // write to stay correct for float (bcd_size = 8) too.
@@ -1224,8 +1226,11 @@ auto write(Float value, char* buffer) noexcept -> char* {
   }
   buffer += extra_digit;
 #if ZMIJ_USE_SSE4_1
-  if constexpr (bcd_size == 16)
-    dig.digits = _mm_shuffle_epi8(dig.digits, _mm_load_si128(m128ptr(&d->bswap)));
+  if (bcd_size == 16) {
+    // dig.digits is uint64_t for float, alias as __m128i to avoid a compiler error.
+    auto& digits = reinterpret_cast<__m128i&>(dig.digits);
+    digits = _mm_shuffle_epi8(digits, _mm_load_si128(m128ptr(&d->bswap)));
+  }
 #endif
   memcpy(buffer, &dig.digits, bcd_size);
   buffer[bcd_size] = '0' + dec.last_digit;
