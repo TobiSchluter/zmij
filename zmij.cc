@@ -584,6 +584,7 @@ struct fixed_layout_table {
       e.shift_pos = e.point_pos + (dec_exp >= 0);
 
 #if ZMIJ_USE_SSE4_1
+      e.shift_extra = dec_exp >= 0 ? e.point_pos : 0;
       for (int extra = 0; extra < 2; ++extra) {
         int pre = bcd_size + extra - 1;
         e.last_digit_pos[extra] =
@@ -596,28 +597,13 @@ struct fixed_layout_table {
         if (dec_exp >= 0) end_pos = n > dec_exp + 1 ? n + 1 : dec_exp + 1;
         e.end_pos[n - 1] = end_pos;
       }
-
-#if ZMIJ_USE_SSE4_1
-      e.shift_extra = dec_exp >= 0 ? e.point_pos : 0;
-#endif
     }
   }
 
-  struct entry_ref {
-    unsigned char start_pos;
-    unsigned char point_pos;
-    // Start position for shifting digits right by one to insert the point.
-    unsigned char shift_pos;
-    //unsigned char pad;
-    // Offset past the end of fixed-notation output, indexed by sig length - 1.
-    const unsigned char* end_pos;
-  };
   constexpr auto get(int dec_exp) const noexcept -> const entry& {
     constexpr auto min = traits::min_fixed_dec_exp;
     assert(dec_exp >= min && dec_exp <= traits::max_fixed_dec_exp);
-    const entry& res = data[unsigned(dec_exp - min)];
-    //return entry_ref{res.start_pos, res.point_pos, res.shift_pos, res.end_pos};
-    return res;
+    return data[unsigned(dec_exp - min)];
   }
 };
 
@@ -733,7 +719,6 @@ struct data {
 #if ZMIJ_USE_NEON
   // Shuffle indices for NEON's write_digits. Offset 0 = identity, offset 1 =
   // shift left by 1 (drops the leading '0' of a 16-digit significand).
-  // SSE4.1 uses the offset trick on d.bswap instead.
   unsigned char shift_shuffle[17] = {0, 1,  2,  3,  4,  5,  6,  7, 8,
                                      9, 10, 11, 12, 13, 14, 15, 0};
 #endif
@@ -898,6 +883,8 @@ template <> struct dec_digits<64> {
 // Converts a significand to decimal digits, removing trailing zeros. value has
 // up to 17 decimal digits (16-17 for normals) for double (num_bits == 64) and
 // up to 9 digits (8-9 for normals) for float.
+// SSE4.1 returns the bytes in reverse order to avoid shuffling twice on the
+// fixed format path.
 template <int num_bits>
 ZMIJ_INLINE auto to_digits(uint64_t value, const data& d) noexcept
     -> dec_digits<num_bits> {
@@ -940,10 +927,6 @@ ZMIJ_INLINE auto to_digits(uint64_t value, const data& d) noexcept
   uint64_t mask = _mm_movemask_epi8(_mm_cmpgt_epi8(bcd, _mm_setzero_si128()));
   // Trailing zeros are in the low bits for SSE4.1, the high bits for SSE2.
   int len = ZMIJ_USE_SSE4_1 ? 16 - ctz(mask) : 64 - clz(mask);
-#  if ZMIJ_USE_SSE4_1
-  // remain shuffled ...
-  //bcd = _mm_shuffle_epi8(bcd, _mm_load_si128(m128ptr(&d.bswap)));  // SSSE3
-#  endif
   return {_mm_or_si128(bcd, zeros), len};
 #endif  // ZMIJ_USE_SSE
 }
@@ -1203,19 +1186,14 @@ auto write(Float value, char* buffer) noexcept -> char* {
           reinterpret_cast<const __m128i*>(bswap_base));
       _mm_storeu_si128(reinterpret_cast<__m128i*>(buffer),
                        _mm_shuffle_epi8(digits, bswap_shift));
-      // Second store: same offset trick, shifted by layout.shift_extra. For
-      // dec_exp < 0 shift_extra == 0, so the shuffle and destination match
-      // the first store - this redundantly rewrites the same bytes instead
-      // of branching. The +(shift_extra != 0) compiles to a setcc, no jump.
+      // For the case dec_exp < 0 shift_extra == 0, so this repeats the previous shuffle
+      // and store.  This is faster than branching.
       unsigned shift_extra = layout.shift_extra;
       __m128i bswap_shift2 = _mm_loadu_si128(
           reinterpret_cast<const __m128i*>(bswap_base + shift_extra));
       _mm_storeu_si128(
           reinterpret_cast<__m128i*>(buffer + shift_extra + (shift_extra != 0)),
           _mm_shuffle_epi8(digits, bswap_shift2));
-      // last_digit_pos is baked with bcd_size = 16, so it only applies here;
-      // the NEON / SSE2 / float fallback below keeps the original pre-memmove
-      // write to stay correct for float (bcd_size = 8) too.
       buffer[layout.last_digit_pos[extra_digit]] = last_digit;
       start[layout.point_pos] = '.';
       return buffer + layout.end_pos[num_digits + extra_digit - 1];
