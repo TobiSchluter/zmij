@@ -549,7 +549,12 @@ struct fixed_layout_table {
       traits::max_fixed_dec_exp - traits::min_fixed_dec_exp + 1;
 
   // On AArch64, align entry to 32 bytes so indexing uses `lsl #5` not `umaddl`.
-  struct alignas(ZMIJ_AARCH64 && !ZMIJ_OPTIMIZE_SIZE ? 32 : 1) entry {
+  // On x86 with SSE4.1, align entry to 64 bytes (one cache line) and put the
+  // 16-byte-aligned shuffle table at the back: the scalar fields and the
+  // shuffle for any single dec_exp then share one cache-line fill.
+  struct alignas(ZMIJ_AARCH64 && !ZMIJ_OPTIMIZE_SIZE ? 32
+                 : ZMIJ_USE_SSE4_1                  ? 64
+                                                    : 1) entry {
     // Byte offset past leading "0.00..." before first significant digit.
     unsigned char start_pos;
     unsigned char point_pos;
@@ -559,14 +564,17 @@ struct fixed_layout_table {
     // Buffer-relative position of the last_digit byte, indexed by extra_digit.
     // Only used for bcd_size == 16 (doubles).
     unsigned char last_digit_pos[2];
-    // pshufb shuffle table that places BCD bytes in their final output slots,
-    // with the byte at the decimal-point position (if any) set to a pshufb
-    // "zero" marker (high bit set).  Indexed by extra_digit.  Only used for
-    // bcd_size == 16.
-    unsigned char shuffle[2][16];
 #endif
     // Offset past the end of fixed-notation output, indexed by sig length - 1.
     unsigned char end_pos[traits::max_digits10];
+#if ZMIJ_USE_SSE4_1
+    // pshufb shuffle table that places BCD bytes in their final output slots,
+    // with the byte at the decimal-point position (if any) set to a pshufb
+    // "zero" marker (high bit set).  Indexed by extra_digit.  Placed last
+    // with explicit 16-byte alignment: paired with entry alignas(64), this
+    // puts shuffle at offset 32 and the whole entry inside one cache line.
+    alignas(16) unsigned char shuffle[2][16];
+#endif
   };
   entry data[num_entries] = {};
 
@@ -1189,7 +1197,7 @@ auto write(Float value, char* buffer) noexcept -> char* {
       // == 1, BCD[15]) in a single SIMD register and store it in one go.  The
       // shuffle table places natural-order BCD bytes in their final output
       // positions with a pshufb zero marker at the decimal point byte.
-      __m128i tbl = _mm_loadu_si128(m128ptr(&layout.shuffle[extra_digit]));
+      __m128i tbl = _mm_load_si128(m128ptr(&layout.shuffle[extra_digit]));
       __m128i out = _mm_shuffle_epi8(digits, tbl);
       memcpy(buffer, &out, bcd_size);
       // For extra_digit == 1 with 0 <= dec_exp <= 14 the BCD[15] byte falls
