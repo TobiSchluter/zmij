@@ -555,6 +555,16 @@ struct fixed_layout_table {
     unsigned char point_pos;
     // Start position for shifting digits right by one to insert the point.
     unsigned char shift_pos;
+#if ZMIJ_USE_SSE4_1
+    // Buffer-relative position of the last_digit byte, indexed by extra_digit.
+    // Only used for bcd_size == 16 (doubles).
+    unsigned char last_digit_pos[2];
+    // pshufb shuffle table that places BCD bytes in their final output slots,
+    // with the byte at the decimal-point position (if any) set to a pshufb
+    // "zero" marker (high bit set).  Indexed by extra_digit.  Only used for
+    // bcd_size == 16.
+    unsigned char shuffle[2][16];
+#endif
     // Offset past the end of fixed-notation output, indexed by sig length - 1.
     unsigned char end_pos[traits::max_digits10];
   };
@@ -568,6 +578,35 @@ struct fixed_layout_table {
       e.start_pos = dec_exp < -0 ? 1 - dec_exp : 0;
       e.point_pos = dec_exp >= 0 ? 1 + dec_exp : 1;
       e.shift_pos = e.point_pos + (dec_exp >= 0);
+
+#if ZMIJ_USE_SSE4_1
+      constexpr int bcd_size = 16;
+      for (int extra = 0; extra < 2; ++extra) {
+        int full_size = bcd_size + extra - 1;
+        e.last_digit_pos[extra] =
+            full_size + ((0 <= dec_exp) && (dec_exp < full_size));
+      }
+
+      // Build the shuffle tables.  to_digits returns natural-order BCD bytes
+      // (BCD[k] at register byte k).  For extra_digit == 1 the integer part
+      // is BCD[0..dec_exp]; for extra_digit == 0 the leading zero is dropped,
+      // so the integer part is BCD[1..dec_exp+1].  In both cases the decimal
+      // point sits at output byte 1 + dec_exp (when in [0, 14]) and is
+      // encoded as a pshufb zero-marker (high bit set).  For dec_exp == 15
+      // or dec_exp < 0 no point lives inside the vector and the entry is
+      // just identity with the extra_digit offset folded in.
+      int hole = (dec_exp >= 0 && dec_exp <= 14) ? 1 + dec_exp : -1;
+      for (int extra = 0; extra < 2; ++extra) {
+        for (int i = 0; i < bcd_size; ++i) {
+          if (i == hole) {
+            e.shuffle[extra][i] = 0xFF;
+          } else {
+            int bcd_idx = (i < hole || hole < 0 ? i : i - 1) + !extra;
+            e.shuffle[extra][i] = (unsigned char)bcd_idx;
+          }
+        }
+      }
+#endif
 
       for (int n = 1; n <= traits::max_digits10; ++n) {
         int end_pos = n;
@@ -1142,6 +1181,27 @@ auto write(Float value, char* buffer) noexcept -> char* {
 
     const auto& layout = fixed_layouts->get(dec_exp);
     buffer += layout.start_pos;
+#if ZMIJ_USE_SSE4_1
+    if (bcd_size == 16) {
+      // dig.digits is uint64_t for float, alias as __m128i to avoid a compiler error.
+      auto& digits = reinterpret_cast<const __m128i&>(dig.digits);
+      // Assemble the digit string (minus the last_digit and, for extra_digit
+      // == 1, BCD[15]) in a single SIMD register and store it in one go.  The
+      // shuffle table places natural-order BCD bytes in their final output
+      // positions with a pshufb zero marker at the decimal point byte.
+      __m128i tbl = _mm_loadu_si128(m128ptr(&layout.shuffle[extra_digit]));
+      __m128i out = _mm_shuffle_epi8(digits, tbl);
+      memcpy(buffer, &out, bcd_size);
+      // For extra_digit == 1 with 0 <= dec_exp <= 14 the BCD[15] byte falls
+      // outside the vector at buffer[16]; write it unconditionally.  In the
+      // other cases (dec_exp == 15, dec_exp < 0, or extra_digit == 0) it's
+      // either already in the vector or overwritten below by '.' / last_digit.
+      buffer[bcd_size] = (char)_mm_extract_epi8(digits, 15);
+      start[layout.point_pos] = '.';
+      buffer[layout.last_digit_pos[extra_digit]] = last_digit;
+      return buffer + layout.end_pos[num_digits + extra_digit - 1];
+    }
+#endif
     write_digits(buffer, dig.digits, !extra_digit, *d);
     buffer[bcd_size + extra_digit - 1] = last_digit;
     unsigned point_pos = layout.point_pos;
