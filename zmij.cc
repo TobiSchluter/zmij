@@ -540,6 +540,68 @@ struct exp_string_table {
   }
 };
 
+// Shuffle masks for branchless float scientific-notation output. A single
+// pshufb assembles "<d>.<rest><e±xx>" from a source register holding the
+// unshuffled (LSD-first, numeric+0x30) BCD in bytes 0..7, the exp string
+// in bytes 8..11, and a small constant dword (byte 12 = '.', byte 13 =
+// last_digit ASCII). The shuffle indices reverse the byte order while
+// plucking, so the bswap that would otherwise materialize `digits` is
+// folded into the mask.
+//
+// In unshuffled form: for extra_digit, MSD lives at byte 7 (LSD at 0);
+// for the leading-zero-padded case (no extra_digit), MSD is at byte 6
+// and byte 7 holds the padding '0'.
+//
+// Index = (num_digits - 1) * 4 + (has_last_digit + 2*extra_digit), with
+// num_digits guaranteed >= 1 in the scientific path. has_last_digit and
+// extra_digit occupy the low bits so the index folds into one LEA.
+struct scientific_float_mask_table {
+  static constexpr bool enable = ZMIJ_USE_SSE4_1;
+
+  alignas(16) unsigned char masks[enable ? 32 * 16 : 1] = {};
+  unsigned char lens[enable ? 32 : 1] = {};
+
+  constexpr scientific_float_mask_table() {
+    if (!enable) return;
+    for (int ndigits = 1; ndigits <= 8; ++ndigits)
+      for (int has_last = 0; has_last < 2; ++has_last)
+        for (int extra_digit = 0; extra_digit < 2; ++extra_digit) {
+          int idx = (ndigits - 1) * 4 + has_last + 2 * extra_digit;
+          unsigned char* out = &masks[idx * 16];
+          for (int i = 0; i < 16; ++i) out[i] = 0x80;  // zero by default
+
+          // Position of the MSD in the LSD-first unshuffled byte order.
+          int msd_byte = extra_digit ? 7 : 6;
+          int l_sig = 1;
+          if (has_last) {
+            // Always 8 BCD chars in the significand plus a last-digit char;
+            // for !extra_digit the leading '0' of the 8-digit padded BCD is shown.
+            l_sig = extra_digit + 9;
+            out[0] = (unsigned char)msd_byte;
+            out[1] = 13;  // '.'
+            int rest_count = extra_digit ? 7 : 6;
+            for (int i = 0; i < rest_count; ++i)
+              out[2 + i] = (unsigned char)(msd_byte - 1 - i);
+            out[l_sig - 1] = 12;  // last_digit
+          } else {
+            int l_sig_pre = extra_digit + ndigits;
+            l_sig = (l_sig_pre == 2) ? 1 : l_sig_pre;
+            out[0] = (unsigned char)msd_byte;
+            if (l_sig > 1) {
+              out[1] = 13;  // '.'
+              for (int i = 2; i < l_sig; ++i)
+                out[i] = (unsigned char)(msd_byte - 1 - (i - 2));
+            }
+          }
+          // Exp string follows the significand.
+          for (int i = 0; i < 4; ++i)
+            out[l_sig + i] = (unsigned char)(8 + i);
+
+          lens[idx] = (unsigned char)(l_sig + 4);
+        }
+  }
+};
+
 // Per-decimal-exponent buffer layout for branchless fixed-notation output.
 // Each entry holds the byte positions of the leading zeros, decimal point,
 // and end of output, indexed by the decimal exponent (dec_exp).
@@ -695,6 +757,7 @@ struct data {
                                      9, 10, 11, 12, 13, 14, 15, 0};
 };
 alignas(64) constexpr data static_data;
+constexpr scientific_float_mask_table scientific_float_masks;
 
 #if ZMIJ_USE_NEON  // An optimized version for NEON by Dougall Johnson.
 
@@ -839,6 +902,17 @@ template <int num_bits> struct dec_digits {
   int num_digits;
 };
 
+// For float on SSE4.1 we keep the unshuffled (LSD-first) numeric BCD around
+// so the scientific path can avoid the xmm→gpr→bswap→xmm roundtrip needed
+// to materialize `digits`.
+#if ZMIJ_USE_SSE4_1
+template <> struct dec_digits<32> {
+  uint64_t digits;
+  __m128i unshuffled;
+  int num_digits;
+};
+#endif
+
 template <> struct dec_digits<64> {
 #if ZMIJ_USE_NEON
   using digits_type = uint16x8_t;
@@ -904,10 +978,22 @@ ZMIJ_INLINE auto to_digits(uint64_t value, const data& d) noexcept
 }
 
 template <>
-ZMIJ_INLINE auto to_digits<32>(uint64_t value, const data&) noexcept
+ZMIJ_INLINE auto to_digits<32>(uint64_t value,
+                               [[ZMIJ_MAYBE_UNUSED]] const data& d) noexcept
     -> dec_digits<32> {
+#if ZMIJ_USE_SSE4_1
+  // Inline to_bcd8's SSE4.1 body so we can return the unshuffled xmm too;
+  // the scientific-notation path uses it to skip the bswap-via-gpr.
+  uint64_t abcd_efgh =
+      value + neg10k * ((value * div10k_sig) >> div10k_exp);
+  __m128i bcd_xmm = to_bcd_4x4(_mm_set_epi64x(0, abcd_efgh), d);
+  uint64_t unshuffled_bcd = _mm_cvtsi128_si64(bcd_xmm);
+  int len = unshuffled_bcd ? 8 - ctz(unshuffled_bcd) / 8 : 0;
+  return {bswap64(unshuffled_bcd) + zeros, bcd_xmm, len};
+#else
   auto result = to_bcd8(value);
   return {result.bcd + zeros, result.len};
+#endif
 }
 
 // Writes `digits` to `buffer`, dropping the leading '0' when drop_leading_zero
@@ -937,6 +1023,42 @@ ZMIJ_INLINE void write_digits(char* buffer, uint64_t digits,
   memcpy(buffer, &digits, sizeof(digits));
   memmove(buffer, buffer + drop_leading_zero, sizeof(digits));
 }
+
+#if ZMIJ_USE_SSE4_1
+// Float scientific-notation tail: packs significand and exponent into a
+// single 16-byte register with one pshufb and stores it. The mask is set
+// up so that the pshufb does the bswap inline (digits are sourced from
+// the unshuffled LSD-first BCD in `dig.unshuffled`), avoiding the
+// xmm→gpr→bswap→xmm roundtrip needed to materialize `dig.digits`.
+ZMIJ_INLINE auto write_scientific_float_simd(
+    char* buffer, const dec_digits<32>& dig, int last_digit_value,
+    bool has_last_digit, bool extra_digit, uint64_t exp_data,
+    const data& d) noexcept -> char* {
+  // Bias BCD digits to ASCII. The high 8 bytes of `dig.unshuffled` are
+  // zero from to_bcd_4x4's input, so OR'ing with the full-splat constant
+  // pollutes them — but `pinsrq` overwrites them immediately.
+  __m128i ascii = _mm_or_si128(dig.unshuffled,
+                               _mm_load_si128(m128ptr(&d.zeros)));
+  uint32_t prefix = ((uint32_t('.') << 8) | (uint32_t('0'))) + 
+                    last_digit_value;
+  uint64_t hi_qword = (exp_data & 0xFFFFFFFFu) | (uint64_t(prefix) << 32);
+  __m128i src = _mm_insert_epi64(ascii, int64_t(hi_qword), 1);
+  int idx = (dig.num_digits - 1) * 4 + int(has_last_digit + 2*extra_digit);
+  __m128i mask = _mm_load_si128(reinterpret_cast<const __m128i*>(
+      &scientific_float_masks.masks[idx * 16]));
+  __m128i out = _mm_shuffle_epi8(src, mask);
+  _mm_storeu_si128(reinterpret_cast<__m128i*>(buffer), out);
+  return buffer + scientific_float_masks.lens[idx];
+}
+
+// Dummy overload so write<double> instantiates cleanly. The runtime
+// guard `traits::num_bits == 32` in `write` folds this call away.
+ZMIJ_INLINE auto write_scientific_float_simd(
+    char*, const dec_digits<64>&, int, bool, bool, uint64_t,
+    const data&) noexcept -> char* {
+  return nullptr;
+}
+#endif
 
 struct to_decimal_result {
   long long sig;
@@ -1149,6 +1271,15 @@ auto write(Float value, char* buffer) noexcept -> char* {
     start[point_pos] = '.';
     return buffer + layout.end_pos[num_digits + extra_digit - 1];
   }
+#if ZMIJ_USE_SSE4_1
+  if (traits::num_bits == 32 && exp_string_table::enable) {
+    uint64_t exp_data = d->exp_strings.data[dec_exp + exp_string_table::offset];
+    return write_scientific_float_simd(buffer, dig, dec.last_digit,
+                                       has_last_digit, extra_digit, exp_data,
+                                       *d);
+  }
+#endif
+
   buffer += extra_digit;
   memcpy(buffer, &dig.digits, bcd_size);
   buffer[bcd_size] = '0' + dec.last_digit;
