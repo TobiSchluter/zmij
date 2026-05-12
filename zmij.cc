@@ -542,63 +542,74 @@ struct exp_string_table {
 
 // Shuffle masks for branchless float scientific-notation output. A single
 // pshufb assembles "<d>.<rest><e±xx>" from a source register holding the
-// unshuffled (LSD-first, numeric+0x30) BCD in bytes 0..7, the exp string
-// in bytes 8..11, and a small constant dword (byte 12 = '.', byte 13 =
-// last_digit ASCII). The shuffle indices reverse the byte order while
-// plucking, so the bswap that would otherwise materialize `digits` is
-// folded into the mask.
+// unshuffled (LSD-first) ASCII digits in bytes 0..7, the exp string
+// in bytes 8..11, the decimal point (byte 12 = '.'), and the last_digit
+// (ASCII, byte 13). The shuffle indices reverse the byte order while
+// inserting the decimal point and placing the exponent after the last
+// non-zero digit.
 //
 // In unshuffled form: for extra_digit, MSD lives at byte 7 (LSD at 0);
 // for the leading-zero-padded case (no extra_digit), MSD is at byte 6
 // and byte 7 holds the padding '0'.
 //
-// Index = (num_digits - 1) * 4 + (has_last_digit + 2*extra_digit), with
-// num_digits guaranteed >= 1 in the scientific path. has_last_digit and
-// extra_digit occupy the low bits so the index folds into one LEA.
+// After benchmnarking, the fastest way of indexing appears to be a flat
+// array with index = (num_digits - 1) * 4 + has_last_digit * 2 + extra_digit.
 struct scientific_float_mask_table {
   static constexpr bool enable = ZMIJ_USE_SSE4_1 || ZMIJ_USE_NEON;
 
   alignas(16) unsigned char masks[enable ? 32 * 16 : 1] = {};
-  unsigned char lens[enable ? 32 : 1] = {};
+  unsigned char lengths[enable ? 32 : 1] = {};
+
+  constexpr auto get_index(int ndigits, int has_last, int has_extra_digit) const noexcept {
+    return (ndigits - 1) * 4 + has_last * 2 + has_extra_digit;
+  }
+
+  struct entry {
+    const unsigned char* mask;
+    unsigned char length;
+  };
+
+  constexpr auto get_entry(int ndigits, bool has_last, bool has_extra_digit) const noexcept {
+    auto idx = get_index(ndigits, has_last, has_extra_digit);
+    return entry{ &masks[idx * 16], lengths[idx] };
+  }
 
   constexpr scientific_float_mask_table() {
     if (!enable) return;
-    for (int ndigits = 1; ndigits <= 8; ++ndigits)
-      for (int has_last = 0; has_last < 2; ++has_last)
+    for (int ndigits = 1; ndigits <= 8; ++ndigits) {
+      for (int has_last = 0; has_last < 2; ++has_last) {
         for (int extra_digit = 0; extra_digit < 2; ++extra_digit) {
-          int idx = (ndigits - 1) * 4 + has_last + 2 * extra_digit;
+          int idx =  get_index(ndigits, has_last, extra_digit);
           unsigned char* out = &masks[idx * 16];
           for (int i = 0; i < 16; ++i) out[i] = 0x80;  // zero by default
 
           // Position of the MSD in the LSD-first unshuffled byte order.
-          int msd_byte = extra_digit ? 7 : 6;
-          int l_sig = 1;
+          unsigned char msd_byte = extra_digit ? 7 : 6;
+          unsigned char length = 0;
           if (has_last) {
             // Always 8 BCD chars in the significand plus a last-digit char;
             // for !extra_digit the leading '0' of the 8-digit padded BCD is shown.
-            l_sig = extra_digit + 9;
-            out[0] = (unsigned char)msd_byte;
-            out[1] = 13;  // '.'
-            int rest_count = extra_digit ? 7 : 6;
-            for (int i = 0; i < rest_count; ++i)
-              out[2 + i] = (unsigned char)(msd_byte - 1 - i);
-            out[l_sig - 1] = 12;  // last_digit
+            out[length++] = msd_byte;
+            out[length++] = 13;  // '.'
+            for (int i = 0; i < (extra_digit ? 7 : 6); ++i)
+              out[length++] = msd_byte - 1 - i;
+            out[length++] = 12;  // last_digit
           } else {
-            int l_sig_pre = extra_digit + ndigits;
-            l_sig = (l_sig_pre == 2) ? 1 : l_sig_pre;
-            out[0] = (unsigned char)msd_byte;
-            if (l_sig > 1) {
+            length = (extra_digit + ndigits == 2) ? 1 : extra_digit + ndigits;
+            out[0] = msd_byte;
+            if (length > 1) {
               out[1] = 13;  // '.'
-              for (int i = 2; i < l_sig; ++i)
-                out[i] = (unsigned char)(msd_byte - 1 - (i - 2));
+              for (int i = 0; i < length - 2; ++i)
+                out[2 + i] = msd_byte - 1 - i;
             }
           }
           // Exp string follows the significand.
-          for (int i = 0; i < 4; ++i)
-            out[l_sig + i] = (unsigned char)(8 + i);
-
-          lens[idx] = (unsigned char)(l_sig + 4);
+          for (unsigned char i = 0; i < 4; ++i)
+            out[length++] = 8 + i;
+          lengths[idx] = length;
         }
+      }
+    }
   }
 };
 
@@ -1044,30 +1055,20 @@ ZMIJ_INLINE void write_digits(char* buffer, uint64_t digits,
 }
 
 #if ZMIJ_USE_SSE4_1
-// Float scientific-notation tail: packs significand and exponent into a
-// single 16-byte register with one pshufb and stores it. The mask is set
-// up so that the pshufb does the bswap inline (digits are sourced from
-// the unshuffled LSD-first BCD in `dig.unshuffled`), avoiding the
-// xmm→gpr→bswap→xmm roundtrip needed to materialize `dig.digits`.
 ZMIJ_INLINE auto write_scientific_float_simd(
     char* buffer, const dec_digits<32>& dig, int last_digit_value,
     bool has_last_digit, bool extra_digit, uint64_t exp_data,
     const data& d) noexcept -> char* {
-  // Bias BCD digits to ASCII. The high 8 bytes of `dig.unshuffled` are
-  // zero from to_bcd_4x4's input, so OR'ing with the full-splat constant
-  // pollutes them — but `pinsrq` overwrites them immediately.
   __m128i ascii = _mm_or_si128(dig.unshuffled,
                                _mm_load_si128(m128ptr(&d.zeros)));
-  uint32_t prefix = ((uint32_t('.') << 8) | (uint32_t('0'))) +
-                    last_digit_value;
+  uint32_t prefix = (uint32_t('.') << 8) + uint32_t('0') + last_digit_value;
   uint64_t hi_qword = (exp_data & 0xFFFFFFFFu) | (uint64_t(prefix) << 32);
   __m128i src = _mm_insert_epi64(ascii, int64_t(hi_qword), 1);
-  int idx = (dig.num_digits - 1) * 4 + int(has_last_digit + 2*extra_digit);
-  __m128i mask = _mm_load_si128(reinterpret_cast<const __m128i*>(
-      &scientific_float_masks.masks[idx * 16]));
+  auto m = scientific_float_masks.get_entry(dig.num_digits, has_last_digit, extra_digit);
+  __m128i mask = _mm_load_si128(m128ptr(m.mask));
   __m128i out = _mm_shuffle_epi8(src, mask);
   _mm_storeu_si128(reinterpret_cast<__m128i*>(buffer), out);
-  return buffer + scientific_float_masks.lens[idx];
+  return buffer + m.length;
 }
 
 // Dummy overload so write<double> instantiates cleanly. The runtime
@@ -1078,27 +1079,22 @@ ZMIJ_INLINE auto write_scientific_float_simd(
   return nullptr;
 }
 #elif ZMIJ_USE_NEON
-// NEON port of the SSE4.1 scientific-notation tail. The mask table is shared
-// — vqtbl1q_u8 zeros out-of-range indices (>= 16), matching pshufb's high-bit
-// semantics, so the 0x80 padding bytes pass through unchanged.
 ZMIJ_INLINE auto write_scientific_float_simd(
     char* buffer, const dec_digits<32>& dig, int last_digit_value,
     bool has_last_digit, bool extra_digit, uint64_t exp_data,
-    [[ZMIJ_MAYBE_UNUSED]] const data& d) noexcept -> char* {
-  // Bias BCD digits to ASCII. The high 8 bytes of `dig.unshuffled` are
-  // zero from to_bcd_4x4's input, so OR'ing with the splat constant
-  // pollutes them — but vsetq_lane_u64 overwrites them immediately.
+    const data&) noexcept -> char* {
   uint8x16_t ascii = vorrq_u8(dig.unshuffled, vdupq_n_u8('0'));
-  uint32_t prefix = ((uint32_t('.') << 8) | (uint32_t('0'))) +
-                    last_digit_value;
+  uint32_t prefix = (uint32_t('.') << 8) + uint32_t('0') + last_digit_value;
   uint64_t hi_qword = (exp_data & 0xFFFFFFFFu) | (uint64_t(prefix) << 32);
   uint8x16_t src = vreinterpretq_u8_u64(
       vsetq_lane_u64(hi_qword, vreinterpretq_u64_u8(ascii), 1));
+
+  auto m = scientific_float_masks.get_entry(dig.num_digits, has_last_digit, extra_digit);
   int idx = (dig.num_digits - 1) * 4 + int(has_last_digit + 2 * extra_digit);
-  uint8x16_t mask = vld1q_u8(&scientific_float_masks.masks[idx * 16]);
+  uint8x16_t mask = vld1q_u8(m.mask);
   uint8x16_t out = vqtbl1q_u8(src, mask);
   vst1q_u8(reinterpret_cast<uint8_t*>(buffer), out);
-  return buffer + scientific_float_masks.lens[idx];
+  return buffer + m.length;
 }
 
 ZMIJ_INLINE auto write_scientific_float_simd(
