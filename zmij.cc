@@ -556,7 +556,7 @@ struct exp_string_table {
 // num_digits guaranteed >= 1 in the scientific path. has_last_digit and
 // extra_digit occupy the low bits so the index folds into one LEA.
 struct scientific_float_mask_table {
-  static constexpr bool enable = ZMIJ_USE_SSE4_1;
+  static constexpr bool enable = ZMIJ_USE_SSE4_1 || ZMIJ_USE_NEON;
 
   alignas(16) unsigned char masks[enable ? 32 * 16 : 1] = {};
   unsigned char lens[enable ? 32 : 1] = {};
@@ -902,13 +902,19 @@ template <int num_bits> struct dec_digits {
   int num_digits;
 };
 
-// For float on SSE4.1 we keep the unshuffled (LSD-first) numeric BCD around
-// so the scientific path can avoid the xmm→gpr→bswap→xmm roundtrip needed
-// to materialize `digits`.
+// For float on SSE4.1/NEON we keep the unshuffled (LSD-first) numeric BCD
+// around so the scientific path can avoid the SIMD→gpr→bswap→SIMD roundtrip
+// needed to materialize `digits`.
 #if ZMIJ_USE_SSE4_1
 template <> struct dec_digits<32> {
   uint64_t digits;
   __m128i unshuffled;
+  int num_digits;
+};
+#elif ZMIJ_USE_NEON
+template <> struct dec_digits<32> {
+  uint64_t digits;
+  uint8x16_t unshuffled;
   int num_digits;
 };
 #endif
@@ -990,6 +996,19 @@ ZMIJ_INLINE auto to_digits<32>(uint64_t value,
   uint64_t unshuffled_bcd = _mm_cvtsi128_si64(bcd_xmm);
   int len = unshuffled_bcd ? 8 - ctz(unshuffled_bcd) / 8 : 0;
   return {bswap64(unshuffled_bcd) + zeros, bcd_xmm, len};
+#elif ZMIJ_USE_NEON
+  // Inline to_bcd8's NEON body so we can return the unshuffled vector too;
+  // the scientific-notation path uses it to skip the simd->gpr->bswap->simd
+  // roundtrip needed to materialize `digits`.
+  uint64_t abcd_efgh =
+      value + neg10k * ((value * div10k_sig) >> div10k_exp);
+  int32x4_t input = vcombine_s32(
+      vreinterpret_s32_u64(vcreate_u64(abcd_efgh)), vdup_n_s32(0));
+  uint8x16_t unshuffled = to_bcd_4x4(input, d);
+  uint64_t unshuffled_bcd = vget_lane_u64(
+      vreinterpret_u64_u8(vget_low_u8(unshuffled)), 0);
+  int len = unshuffled_bcd ? 8 - ctz(unshuffled_bcd) / 8 : 0;
+  return {bswap64(unshuffled_bcd) + zeros, unshuffled, len};
 #else
   auto result = to_bcd8(value);
   return {result.bcd + zeros, result.len};
@@ -1039,7 +1058,7 @@ ZMIJ_INLINE auto write_scientific_float_simd(
   // pollutes them — but `pinsrq` overwrites them immediately.
   __m128i ascii = _mm_or_si128(dig.unshuffled,
                                _mm_load_si128(m128ptr(&d.zeros)));
-  uint32_t prefix = ((uint32_t('.') << 8) | (uint32_t('0'))) + 
+  uint32_t prefix = ((uint32_t('.') << 8) | (uint32_t('0'))) +
                     last_digit_value;
   uint64_t hi_qword = (exp_data & 0xFFFFFFFFu) | (uint64_t(prefix) << 32);
   __m128i src = _mm_insert_epi64(ascii, int64_t(hi_qword), 1);
@@ -1053,6 +1072,35 @@ ZMIJ_INLINE auto write_scientific_float_simd(
 
 // Dummy overload so write<double> instantiates cleanly. The runtime
 // guard `traits::num_bits == 32` in `write` folds this call away.
+ZMIJ_INLINE auto write_scientific_float_simd(
+    char*, const dec_digits<64>&, int, bool, bool, uint64_t,
+    const data&) noexcept -> char* {
+  return nullptr;
+}
+#elif ZMIJ_USE_NEON
+// NEON port of the SSE4.1 scientific-notation tail. The mask table is shared
+// — vqtbl1q_u8 zeros out-of-range indices (>= 16), matching pshufb's high-bit
+// semantics, so the 0x80 padding bytes pass through unchanged.
+ZMIJ_INLINE auto write_scientific_float_simd(
+    char* buffer, const dec_digits<32>& dig, int last_digit_value,
+    bool has_last_digit, bool extra_digit, uint64_t exp_data,
+    [[ZMIJ_MAYBE_UNUSED]] const data& d) noexcept -> char* {
+  // Bias BCD digits to ASCII. The high 8 bytes of `dig.unshuffled` are
+  // zero from to_bcd_4x4's input, so OR'ing with the splat constant
+  // pollutes them — but vsetq_lane_u64 overwrites them immediately.
+  uint8x16_t ascii = vorrq_u8(dig.unshuffled, vdupq_n_u8('0'));
+  uint32_t prefix = ((uint32_t('.') << 8) | (uint32_t('0'))) +
+                    last_digit_value;
+  uint64_t hi_qword = (exp_data & 0xFFFFFFFFu) | (uint64_t(prefix) << 32);
+  uint8x16_t src = vreinterpretq_u8_u64(
+      vsetq_lane_u64(hi_qword, vreinterpretq_u64_u8(ascii), 1));
+  int idx = (dig.num_digits - 1) * 4 + int(has_last_digit + 2 * extra_digit);
+  uint8x16_t mask = vld1q_u8(&scientific_float_masks.masks[idx * 16]);
+  uint8x16_t out = vqtbl1q_u8(src, mask);
+  vst1q_u8(reinterpret_cast<uint8_t*>(buffer), out);
+  return buffer + scientific_float_masks.lens[idx];
+}
+
 ZMIJ_INLINE auto write_scientific_float_simd(
     char*, const dec_digits<64>&, int, bool, bool, uint64_t,
     const data&) noexcept -> char* {
@@ -1271,7 +1319,7 @@ auto write(Float value, char* buffer) noexcept -> char* {
     start[point_pos] = '.';
     return buffer + layout.end_pos[num_digits + extra_digit - 1];
   }
-#if ZMIJ_USE_SSE4_1
+#if ZMIJ_USE_SSE4_1 || ZMIJ_USE_NEON
   if (traits::num_bits == 32 && exp_string_table::enable) {
     uint64_t exp_data = d->exp_strings.data[dec_exp + exp_string_table::offset];
     return write_scientific_float_simd(buffer, dig, dec.last_digit,
