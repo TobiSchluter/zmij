@@ -617,8 +617,7 @@ struct fixed_layout_table {
 #endif
 
       for (int n = 1; n <= traits::max_digits10; ++n) {
-        int end_pos = n;
-        if (dec_exp >= 0) end_pos = n > dec_exp + 1 ? n + 1 : dec_exp + 1;
+        int end_pos = dec_exp < 0 ? n : (n > dec_exp + 1 ? n + 1 : dec_exp + 1);
         e.end_pos[n - 1] = end_pos;
       }
     }
