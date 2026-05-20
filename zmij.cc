@@ -573,7 +573,7 @@ struct fixed_layout_table {
     // "zero" marker (high bit set).  Indexed by extra_digit.  Placed last
     // with explicit 16-byte alignment: paired with entry alignas(64), this
     // puts shuffle at offset 32 and the whole entry inside one cache line.
-    alignas(16) unsigned char shuffle[2][16];
+    alignas(16) unsigned char shuffle[16];
 #endif
   };
   entry data[num_entries] = {};
@@ -607,10 +607,10 @@ struct fixed_layout_table {
       for (int extra = 0; extra < 2; ++extra) {
         for (int i = 0; i < bcd_size; ++i) {
           if (i == hole) {
-            e.shuffle[extra][i] = 0xFF;
+            e.shuffle[i] = 0xFF;
           } else {
-            int bcd_idx = (i < hole || hole < 0 ? i : i - 1) + !extra;
-            e.shuffle[extra][i] = (unsigned char)bcd_idx;
+            int bcd_idx = (i < hole || hole < 0 ? i : i - 1) + 1; // case with extra_digit, we obtain the case without by subtracting extradigit
+            e.shuffle[i] = (unsigned char)bcd_idx;
           }
         }
       }
@@ -1196,7 +1196,8 @@ auto write(Float value, char* buffer) noexcept -> char* {
       // == 1, BCD[15]) in a single SIMD register and store it in one go.  The
       // shuffle table places natural-order BCD bytes in their final output
       // positions with a pshufb zero marker at the decimal point byte.
-      __m128i tbl = _mm_load_si128(m128ptr(&layout.shuffle[extra_digit]));
+      __m128i tbl = _mm_load_si128(m128ptr(&layout.shuffle));
+      tbl = _mm_add_epi8(tbl, _mm_set1_epi8(extra_digit ? -1 : 0));
       __m128i out = _mm_shuffle_epi8(digits, tbl);
       memcpy(buffer, &out, bcd_size);
       // For extra_digit == 1 with 0 <= dec_exp <= 14 the BCD[15] byte falls
