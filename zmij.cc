@@ -1173,11 +1173,11 @@ auto write(Float value, char* buffer) noexcept -> char* {
 
   // Write significand/fixed.
   char* start = buffer;
-  auto dig = to_digits<traits::num_bits>(dec.sig, *d);
   constexpr int bcd_size = traits::num_bits == 64 ? 16 : 8;
   if (dec_exp >= traits::min_fixed_dec_exp &&
       dec_exp <= traits::max_fixed_dec_exp) {
     memcpy(start, &zeros, 8);  // For dec_exp < 0.
+    auto dig = to_digits<traits::num_bits>(dec.sig, *d);
     char last_digit = '0' + (-has_last_digit & dec.last_digit);
     int num_digits = select(has_last_digit, bcd_size, dig.num_digits - 1);
 
@@ -1190,18 +1190,18 @@ auto write(Float value, char* buffer) noexcept -> char* {
     buffer += layout.start_pos;
 #if ZMIJ_USE_SSE4_1
     if (bcd_size == 16) {
-      // dig.digits is uint64_t for float, alias as __m128i to avoid a compiler error.
-      auto& digits = reinterpret_cast<const __m128i&>(dig.digits);
       // Assemble the digit string (minus the last_digit and, for extra_digit
       // == 1, BCD[15]) in a single SIMD register and store it in one go. 
       __m128i tbl = _mm_load_si128(m128ptr(&layout.shuffle[extra_digit]));
-      __m128i out = _mm_shuffle_epi8(digits, tbl);
-      memcpy(buffer, &out, bcd_size);
+      // dig.digits is uint64_t for float, alias as __m128i to avoid a compiler error.
+      auto& digits = reinterpret_cast<const __m128i&>(dig.digits);
       // For extra_digit == 1 with 0 <= dec_exp <= 14 the BCD[15] byte falls
       // outside the vector at buffer[16]; write it unconditionally.  In the
       // other cases (dec_exp == 15, dec_exp < 0, or extra_digit == 0) it's
       // either already in the vector or overwritten below by '.' / last_digit.
       buffer[bcd_size] = (char)_mm_extract_epi8(digits, 15);
+      __m128i out = _mm_shuffle_epi8(digits, tbl);
+      memcpy(buffer, &out, bcd_size);
       start[layout.point_pos] = '.';
       buffer[layout.last_digit_pos[extra_digit]] = last_digit;
       return buffer + layout.end_pos[num_digits + extra_digit - 1];
@@ -1215,6 +1215,7 @@ auto write(Float value, char* buffer) noexcept -> char* {
     return buffer + layout.end_pos[num_digits + extra_digit - 1];
   }
   buffer += extra_digit;
+  auto dig = to_digits<traits::num_bits>(dec.sig, *d);
   memcpy(buffer, &dig.digits, bcd_size);
   buffer[bcd_size] = '0' + dec.last_digit;
   buffer += select(has_last_digit, bcd_size + 1, dig.num_digits);
