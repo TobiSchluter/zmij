@@ -72,7 +72,6 @@ template <typename T> auto log_uniform_data() -> std::vector<T> {
   std::vector<T> data;
   wide_uint lo = 0, hi = 9;
   for (;;) {
-    if (hi > max_magnitude) hi = max_magnitude;
     wide_uint span = hi - lo + 1;  // 0 only for the full wide_uint range
     for (size_t i = 0; i != entries_per_digit_count; ++i) {
       wide_uint bits = random_bits<wide_uint>(gen);
@@ -82,7 +81,9 @@ template <typename T> auto log_uniform_data() -> std::vector<T> {
     }
     if (hi == max_magnitude) break;
     lo = hi + 1;
-    hi = hi * 10 + 9;
+    // Clamp before multiplying: for a type spanning all of wide_uint the
+    // top digit count is partial and hi * 10 + 9 would wrap.
+    hi = hi > (max_magnitude - 9) / 10 ? max_magnitude : hi * 10 + 9;
   }
   std::shuffle(data.begin(), data.end(), gen);
   return data;
