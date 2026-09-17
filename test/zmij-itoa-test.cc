@@ -41,9 +41,14 @@ template <typename T> constexpr auto max_magnitude() -> wide_uint {
 }
 
 template <typename T> constexpr auto buffer_size() -> size_t {
-  return sizeof(T) <= 4 ? size_t(zmij::int32_buffer_size)
-         : sizeof(T) <= 8 ? size_t(zmij::int64_buffer_size)
-                          : size_t(zmij::int128_buffer_size);
+  if (is_signed_int<T>()) {
+    return sizeof(T) <= 4   ? size_t(zmij::int32_buffer_size)
+           : sizeof(T) <= 8 ? size_t(zmij::int64_buffer_size)
+                            : size_t(zmij::int128_buffer_size);
+  }
+  return sizeof(T) <= 4   ? size_t(zmij::uint32_buffer_size)
+         : sizeof(T) <= 8 ? size_t(zmij::uint64_buffer_size)
+                          : size_t(zmij::uint128_buffer_size);
 }
 
 // Formats value with zmij::write into an exactly buffer_size<T>()-sized
