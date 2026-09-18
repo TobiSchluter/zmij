@@ -661,11 +661,49 @@ constexpr int div100_exp = 19;
 constexpr uint32_t div100_sig = (1 << div100_exp) / 100 + 1;
 constexpr uint32_t neg100 = (1 << 16) - 100;
 
+// Generate the f32 significand's digits with jeaiii's fraction chain instead
+// of the base-10^4 -> 10^2 -> 10^1 splitting tree.
+#ifndef ZMIJ_F32_CHAIN
+#  define ZMIJ_F32_CHAIN 0
+#endif
+// The chain serves fixed notation on SSE4.1 only. Scientific stays on the
+// splitting tree, whose one-shuffle assembly the chain cannot beat, and NEON
+// stays on the tree for both: a wide core runs the tree's parallel splits well
+// and a serial multiply chain cannot use the width (measured +7% fixed, +21%
+// scientific on an Apple M5).
+#define ZMIJ_F32_CHAIN_ON (ZMIJ_F32_CHAIN && ZMIJ_USE_SSE4_1)
+// f = w * f32_chain_mul9 puts w / 1e8 -- with w left-aligned to nine digits,
+// the leading digit on its own -- in a field above a 57-bit fraction, and four
+// (f & f32_chain_mask) * 100 steps re-scale that fraction to expose the
+// remaining eight digits as pairs. jeaiii's +1 makes truncation land on the
+// right digit at every step; the chain is exact for every w < 2^32, which nine
+// digits stays inside.
+constexpr uint64_t f32_chain_mask = (uint64_t(1) << 57) - 1;
+constexpr uint64_t f32_chain_mul9 = uint64_t((uint64_t(1) << 57) / 1e8) + 1;
+// For an 8-digit significand: v * f32_chain_mul8 == (v * 10) * mul9 bit for
+// bit, so the 9-digit chain's exactness carries over unchanged, and v < 1e8
+// keeps the product under 2^64.
+constexpr uint64_t f32_chain_mul8 = 10 * f32_chain_mul9;
+
 constexpr int div10_exp = 10;
 constexpr uint32_t div10_sig = (1 << div10_exp) / 10 + 1;
 constexpr uint32_t neg10 = (1 << 8) - 10;
 
 constexpr uint64_t zeros = 0x0101010101010101u * '0';
+
+// Digit pairs for the f32 fraction chain, natural order: entry i holds i / 10
+// in the low byte and i % 10 in the high byte. The chain emits pairs most
+// significant first, so accumulating them with ascending shifts lays the digits
+// down in print order -- which is what fixed notation stores directly and what
+// the scientific shuffle indexes. Raw BCD, not ASCII; the '0' bias is ORed in
+// once over the whole register.
+struct f32_pair_table {
+  uint16_t pairs[100] = {};
+  constexpr f32_pair_table() {
+    for (int i = 0; i < 100; ++i)
+      pairs[i] = uint16_t((i / 10) | ((i % 10) << 8));
+  }
+};
 
 struct data {
   static constexpr auto splat64(uint64_t x) -> uint128 { return {x, x}; }
@@ -738,6 +776,13 @@ struct data {
   // shift left by 1 (drops the leading '0' of a 16-digit significand).
   unsigned char shift_shuffle[17] = {0, 1,  2,  3,  4,  5,  6,  7, 8,
                                      9, 10, 11, 12, 13, 14, 15, 0};
+#if ZMIJ_F32_CHAIN_ON
+  // Last, so enabling the chain does not shift any other member's offset.
+  f32_pair_table f32_pairs;
+  // Chain multiplier by significand width, indexed by has_extra_digit: v is 8
+  // or 9 digits, so only those two are reachable.
+  uint64_t f32_chain_mul[2] = {f32_chain_mul8, f32_chain_mul9};
+#endif
 };
 alignas(64) constexpr data static_data;
 
@@ -890,6 +935,25 @@ template <int num_bits> struct dec_digits {
   int num_digits;
 };
 
+// Significant digit count of eight reversed BCD bytes (byte 0 = last digit):
+// 8 minus the trailing zero bytes, 0 for all zero. Branchless and without a
+// select: tzcnt returns 64 for 0, which lands on 0 by itself, and the count is
+// never negative so the shift is exact -- a signed / 8 would cost a
+// round-toward-zero fixup on the path feeding the shuffle-table load.
+ZMIJ_INLINE auto count_bcd8(uint64_t bcd) noexcept -> int {
+#if ZMIJ_HAS_BUILTIN(__builtin_ctzg)
+  // Defined at 0 (returns the fallback, 64): bare tzcnt on x86 with BMI, bare
+  // rbit + clz on AArch64, whose bit-count instructions are zero-safe anyway.
+  return 8 - int(unsigned(__builtin_ctzg(bcd, 64)) >> 3);
+#elif defined(__BMI__)
+  return 8 - int(_tzcnt_u64(bcd) >> 3);
+#else
+  // ctz is undefined at 0: setting bit 63 (never a BCD bit) pins it to 63,
+  // and the all-zero case is corrected arithmetically.
+  return 8 - int(unsigned(ctz(bcd | (uint64_t(1) << 63))) >> 3) - (bcd == 0);
+#endif
+}
+
 template <> struct dec_digits<64> {
 #if ZMIJ_USE_NEON
   using digits_type = uint16x8_t;
@@ -964,7 +1028,7 @@ ZMIJ_INLINE auto to_digits<32>(uint64_t value,
   uint64_t abcd_efgh = value + neg10k * ((value * div10k_sig) >> div10k_exp);
   __m128i bcd_xmm = to_bcd_4x4(_mm_set_epi64x(0, abcd_efgh), d);
   uint64_t unshuffled_bcd = _mm_cvtsi128_si64(bcd_xmm);
-  int len = unshuffled_bcd ? 8 - ctz(unshuffled_bcd) / 8 : 0;
+  int len = count_bcd8(unshuffled_bcd);
   return {bcd_xmm, bswap64(unshuffled_bcd) + zeros, len};
 #elif ZMIJ_USE_NEON
   // Inline to_bcd8's NEON body so we can return the unshuffled vector too;
@@ -976,7 +1040,7 @@ ZMIJ_INLINE auto to_digits<32>(uint64_t value,
   uint8x16_t unshuffled = to_bcd_4x4(input, d);
   uint64_t unshuffled_bcd =
       vget_lane_u64(vreinterpret_u64_u8(vget_low_u8(unshuffled)), 0);
-  int len = unshuffled_bcd ? 8 - ctz(unshuffled_bcd) / 8 : 0;
+  int len = count_bcd8(unshuffled_bcd);
   return {unshuffled, bswap64(unshuffled_bcd) + zeros, len};
 #else
   auto result = to_bcd8(value);
@@ -1024,17 +1088,21 @@ ZMIJ_INLINE auto write_scientific_simd(char* buffer, const dec_digits<32>& dig,
   uint64_t tail = exp_data | (uint64_t(prefix) << 32);
   auto entry = d.exp_float_shuffles.get_entry(dig.num_digits, has_last_digit,
                                               has_extra_digit);
+  // tail is known before the digits are, so it goes into the bias register
+  // first and only the OR waits on the digits; the insert leaves the tail of
+  // the dependency chain. unshuffled's upper lane is the BCD of a zero upper
+  // half, so OR-ing it into the inserted tail changes nothing.
 #if ZMIJ_USE_SSE4_1
-  __m128i ascii =
-      _mm_or_si128(dig.unshuffled, _mm_load_si128(m128ptr(&d.zeros)));
-  __m128i src = _mm_insert_epi64(ascii, int64_t(tail), 1);
+  __m128i bias = _mm_insert_epi64(_mm_load_si128(m128ptr(&d.zeros)),
+                                  int64_t(tail), 1);
+  __m128i src = _mm_or_si128(dig.unshuffled, bias);
   __m128i shuffle = _mm_load_si128(m128ptr(entry.shuffle));
   __m128i out = _mm_shuffle_epi8(src, shuffle);
   _mm_storeu_si128(reinterpret_cast<__m128i*>(buffer), out);
 #elif ZMIJ_USE_NEON
-  uint8x16_t ascii = vorrq_u8(dig.unshuffled, vdupq_n_u8('0'));
-  uint8x16_t src = vreinterpretq_u8_u64(
-      vsetq_lane_u64(tail, vreinterpretq_u64_u8(ascii), 1));
+  uint8x16_t bias = vreinterpretq_u8_u64(
+      vsetq_lane_u64(tail, vreinterpretq_u64_u8(vdupq_n_u8('0')), 1));
+  uint8x16_t src = vorrq_u8(dig.unshuffled, bias);
   uint8x16_t shuffle = vld1q_u8(entry.shuffle);
   uint8x16_t out = vqtbl1q_u8(src, shuffle);
   vst1q_u8(reinterpret_cast<uint8_t*>(buffer), out);
@@ -1047,6 +1115,75 @@ ZMIJ_INLINE auto write_scientific_simd(char*, const dec_digits<64>&, int, bool,
     -> char* {
   return nullptr;
 }
+
+#if ZMIJ_F32_CHAIN_ON
+// Writes a float's significand in fixed notation with jeaiii's fraction chain.
+//
+// to_decimal keeps the split form the tree's scientific path wants, so the
+// extra digit is folded back in here: one lea and an add, and the width the
+// multiplier needs is just has_extra_digit, since sig is 7 or 8 digits and v
+// one more. Four dependent (f & mask) * 100 steps then emit every digit, with
+// the leading one falling out of the first step's index and the trailing zeros
+// marking the end -- so nothing here needs a digit count or a flag.
+//
+// Not a template: one instantiation, and `write` only reaches it for float.
+ZMIJ_INLINE auto write_float32_chain(char* buffer, long long sig,
+                                     int last_digit, bool has_last_digit,
+                                     bool has_extra_digit, int dec_exp,
+                                     const data& d) noexcept -> char* {
+  uint64_t v = uint64_t(sig) * 10 + (uint64_t(-int64_t(has_last_digit)) &
+                                     uint64_t(last_digit));
+  // v has 8 or 9 digits; the multiplier left-aligns it to nine so the first
+  // step's index is the leading digit. A memory operand, so the load runs
+  // ahead of v rather than materialising a 34-bit constant behind a select.
+  uint64_t f = v * d.f32_chain_mul[has_extra_digit];
+  // The leading slot's pair index is v / 1e8, which that alignment pins to
+  // 1..9 -- so the index is D1 itself, one multiply in. It goes to memory on
+  // its own, which frees lo to hold D2..D9 in exactly eight bytes.
+  char d1 = char('0' + (f >> 57));
+  f = (f & f32_chain_mask) * 100;
+  uint64_t lo = d.f32_pairs.pairs[f >> 57];            // D2 D3
+  f = (f & f32_chain_mask) * 100;
+  lo |= uint64_t(d.f32_pairs.pairs[f >> 57]) << 16;    // D4 D5
+  f = (f & f32_chain_mask) * 100;
+  lo |= uint64_t(d.f32_pairs.pairs[f >> 57]) << 32;    // D6 D7
+  f = (f & f32_chain_mask) * 100;
+  lo |= uint64_t(d.f32_pairs.pairs[f >> 57]) << 48;    // D8 D9
+
+  // lo's leading zero bytes are the trailing zero digits among D2..D9; all of
+  // them zero means D1 stands alone, which lzcnt's count of 64 for 0 lands on
+  // by itself -- no select, no branch. A branch here mispredicts every tenth
+  // call on a realistic digit mix. >> 3, not / 8: the count is never negative,
+  // so no signed-division fixup on the path feeding end_pos.
+#if ZMIJ_HAS_BUILTIN(__builtin_clzg) && (defined(__LZCNT__) || defined(__clang__))
+  // Lowered to a bare instruction in these configurations: lzcnt, or clang's
+  // bsr into a preset register. Not gcc without LZCNT, which expands clzg as
+  // `test; je; bsr` -- exactly the branch this is avoiding.
+  int num_digits = 9 - int(unsigned(__builtin_clzg(lo, 64)) >> 3);
+#elif defined(__LZCNT__)
+  int num_digits = 9 - int(_lzcnt_u64(lo) >> 3);
+#else
+  // lo | 1 pins clz to at most 63; gcc turns the zero correction into cmp/sbb.
+  int num_digits = 9 - int(unsigned(clz(lo | 1)) >> 3) - int(lo == 0);
+#endif
+
+  // The digits are already in print order, so they go to memory straight from
+  // the GPRs: D1, then D2..D9 in one store. The shared layout table applies
+  // unchanged and only the point has to be opened up.
+  char* start = buffer;
+  memcpy(start, &zeros, 8);  // Leading "0.000" for dec_exp < 0.
+  fixed_layout_table::entry scratch;
+  const auto& layout = d.fixed_layouts.get(dec_exp, scratch);
+  buffer += layout.start_pos;
+  buffer[0] = d1;
+  uint64_t ascii = lo | zeros;
+  memcpy(buffer + 1, &ascii, 8);
+  unsigned point_pos = layout.point_pos;
+  memmove(start + layout.shift_pos, start + point_pos, 8);
+  start[point_pos] = '.';
+  return buffer + layout.end_pos[num_digits - 1];
+}
+#endif  // ZMIJ_F32_CHAIN_ON
 
 // Writes "inf"/"nan" with one 4-byte store, so the buffer must hold 4 bytes.
 auto write_inf_nan(char* buffer, bool is_nan) noexcept -> char* {
@@ -1671,6 +1808,16 @@ auto write(char* buffer, Float value) noexcept -> char* {
     has_last_digit = false;
     --dec_exp;
   }
+
+#if ZMIJ_F32_CHAIN_ON
+  // Fixed notation only, and ahead of to_digits so the tree's digit kernel is
+  // not computed for values the chain will write.
+  if (traits::num_bits == 32 && dec_exp >= traits::min_fixed_dec_exp &&
+      dec_exp <= traits::max_fixed_dec_exp) {
+    return write_float32_chain(buffer, dec.sig, dec.last_digit, has_last_digit,
+                               has_extra_digit, dec_exp, *d);
+  }
+#endif
 
   // Write significand/fixed.
   char* start = buffer;
