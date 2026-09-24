@@ -456,10 +456,19 @@ struct exp_string_table {
       uint64_t abs_e = e >= 0 ? e : -e;
       uint64_t bc = abs_e % 100;
       uint64_t val = ((bc % 10 + '0') << 8) | (bc / 10 + '0');
-      if (uint64_t a = abs_e / 100) val = (val << 8) | (a + '0');
+      if (uint64_t a = abs_e / 100)
+        val = (val << 8) | (a + '0');
+      else
+        val |= uint64_t('0') << 16;
       uint64_t len = 4 + (abs_e >= 100);
-      t.data[e + offset] =
-          (len << 48) | (val << 16) | (uint64_t(e >= 0 ? '+' : '-') << 8) | 'e';
+      // Bytes: 'e', sign, two digits, a third digit or '0', '.', '0', length.
+      // The float emitters insert an entry whole and add their last digit to
+      // the '0' in byte 4, so the point and the zero their shuffles need ride
+      // along and the length lands in a register byte nothing reads; the
+      // double path stores all eight bytes and returns past `len` of them.
+      t.data[e + offset] = (len << 56) | (uint64_t('0') << 48) |
+                           (uint64_t('.') << 40) | (val << 16) |
+                           (uint64_t(e >= 0 ? '+' : '-') << 8) | 'e';
     }
     return t;
   }
@@ -1073,15 +1082,14 @@ ZMIJ_INLINE auto write_float_simd(char* buffer, const dec_digits<32>& dig,
                                   int last_digit, bool has_last_digit,
                                   bool has_extra_digit, int dec_exp,
                                   const data& d) noexcept -> char* {
-  // Packed for insertion into lane 1: byte 0 of `tail` lands at register
-  // byte exp_pos (8), so the exp string fills exp_pos..exp_pos+3; the prefix
-  // shifts place '0'+last_digit at last_digit_pos (12), '.' at point_pos (13)
-  // and '0' at zero_pos (14). Only exp_data's four exponent chars are used; the
-  // length it also carries comes from the shuffle entry instead.
+  // Inserted whole into lane 1: byte 0 of the entry lands at register byte
+  // exp_pos (8), so the exp string fills exp_pos..exp_pos+3, its '.' and '0'
+  // land at point_pos (13) and zero_pos (14), and its '0' at last_digit_pos
+  // (12) only has the last digit added to it. The entry's length ends up in
+  // byte 15, which no shuffle reads; the output length comes from the shuffle
+  // entry.
   uint64_t exp_data = d.exp_strings.data[dec_exp + exp_string_table::offset];
-  uint32_t prefix = (uint32_t('.') << 8) + uint32_t('0') + last_digit;
-  uint64_t tail =
-      uint32_t(exp_data) | (uint64_t(prefix) << 32) | (uint64_t('0') << 48);
+  uint64_t tail = exp_data + (uint64_t(last_digit) << 32);
   auto entry = d.float_shuffles.get_entry(dec_exp, dig.num_digits,
                                           has_last_digit, has_extra_digit);
 #if ZMIJ_USE_SSE4_1
@@ -1788,7 +1796,7 @@ auto write(char* buffer, Float value) noexcept -> char* {
   // Write exponent.
   if (exp_string_table::enable) {
     uint64_t exp_data = d->exp_strings.data[dec_exp + exp_string_table::offset];
-    int len = int(exp_data >> 48);
+    int len = int(exp_data >> 56);
     if (is_big_endian) exp_data = bswap64(exp_data);
     memcpy(buffer, &exp_data, traits::max_exponent10 >= 100 ? 8 : 4);
     return buffer + len;
