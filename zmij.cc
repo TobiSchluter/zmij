@@ -738,12 +738,11 @@ constexpr uint32_t neg100 = (1 << 16) - 100;
 #define ZMIJ_F32_CHAIN_ON (ZMIJ_F32_CHAIN && ZMIJ_USE_SSE4_1)
 #if ZMIJ_F32_CHAIN_ON
 // f = w * f32_chain_mul9 puts w / 1e8 -- with w left-aligned to nine digits,
-// the leading digit on its own -- in a field above a 57-bit fraction, and four
-// (f & f32_chain_mask) * 100 steps re-scale that fraction to expose the
-// remaining eight digits as pairs. jeaiii's +1 makes truncation land on the
-// right digit at every step; the chain is exact for every w < 2^32, which nine
-// digits stays inside.
-constexpr uint64_t f32_chain_mask = (uint64_t(1) << 57) - 1;
+// the leading digit on its own -- in a field above a 57-bit fraction, and
+// (f & mask) * 10^k steps re-scale that fraction to expose the remaining
+// eight digits in groups. jeaiii's +1 makes truncation land on the right digit
+// at every step; the chain is exact for every w < 2^32, which nine digits
+// stays inside.
 constexpr uint64_t f32_chain_mul9 = uint64_t((uint64_t(1) << 57) / 1e8) + 1;
 // The chain runs on 10 * sig, so its multiplier is 10 * mul9: sig * mul8 ==
 // (10 * sig) * mul9 bit for bit, the 9-digit chain's exactness carries over
@@ -763,11 +762,19 @@ constexpr uint64_t zeros = 0x0101010101010101u * '0';
 // one, so the digits come out byte-reversed -- the last in byte 0 -- and the
 // layout shuffle indexes them that way. Raw BCD, not ASCII; the '0' bias is
 // ORed in once over the whole register.
-struct f32_pair_table {
-  uint16_t pairs[100] = {};
-  constexpr f32_pair_table() {
-    for (int i = 0; i < 100; ++i)
-      pairs[i] = uint16_t((i % 10) | ((i / 10) << 8));
+// Digit triples for the f32 fraction chain, reversed: entry i holds its three
+// digits least significant first in the low three bytes, the top byte zero.
+// The chain emits groups most significant first and shifts its accumulator up
+// to make room for each next one, so the digits come out byte-reversed -- the
+// last in byte 0 -- and the layout shuffle indexes them that way. The final
+// two-digit group comes from the same table. Raw BCD, not ASCII; the '0' bias
+// is ORed in once over the whole register.
+struct f32_triple_table {
+  uint32_t triples[1000] = {};
+  constexpr f32_triple_table() {
+    for (int i = 0; i < 1000; ++i)
+      triples[i] = uint32_t(i % 10) | uint32_t(i / 10 % 10) << 8 |
+                   uint32_t(i / 100) << 16;
   }
 };
 
@@ -930,7 +937,7 @@ struct data {
                                      9, 10, 11, 12, 13, 14, 15, 0};
 #if ZMIJ_F32_CHAIN_ON
   // Last, so enabling the chain does not shift any other member's offset.
-  f32_pair_table f32_pairs;
+  f32_triple_table f32_triples;
   f32_chain_shuffle_table f32_shuffles = f32_chain_shuffle_table::enable
                                              ? f32_chain_shuffle_table::make()
                                              : f32_chain_shuffle_table();
@@ -1250,9 +1257,10 @@ ZMIJ_INLINE auto write_float_simd(char*, const dec_digits<64>&, int, bool, bool,
 #if ZMIJ_F32_CHAIN_ON
 // Writes a float in either notation with jeaiii's fraction chain.
 //
-// One multiply puts 10 * sig / 1e8 above a 57-bit fraction, and four dependent
-// (f & mask) * 100 steps emit the remaining digits as pairs, the trailing zeros
-// marking the end. to_decimal keeps the split form the tree wants -- sig of 7
+// One multiply puts 10 * sig / 1e8 above a 57-bit fraction, and three dependent
+// (f & mask) * 10^k steps emit the remaining digits in groups of 3, 3 and 2,
+// the trailing zeros marking the end. to_decimal keeps the split form the tree
+// wants -- sig of 7
 // or 8 digits plus a rounded last digit -- and both are taken as they are: the
 // width is absorbed by the shuffle table and the last digit is ORed into the
 // slot the chain leaves free, so nothing here waits on either.
@@ -1278,22 +1286,24 @@ ZMIJ_INLINE auto write_float32_chain(char* buffer, long long sig,
   uint64_t f = uint64_t(sig) * f32_chain_mul8;
   // The leading slot's pair index is 10 * sig / 1e8: D1 with the extra digit,
   // 0 without. It goes into the tail register on its own, added to the '0'
-  // the exponent entry carries there, which frees lo to hold the next eight
-  // digits exactly. The accumulator is what shifts, not the pair: lo is ready
-  // long before each next pair arrives, so after the last pair load only the
-  // OR remains on the path.
+  // the exponent entry carries there.
   uint64_t d1 = f >> 57;
-  f = (f & f32_chain_mask) * 100;
-  uint64_t lo = d.f32_pairs.pairs[f >> 57];            // D2 D3
-  f = (f & f32_chain_mask) * 100;
-  lo = lo << 16 | d.f32_pairs.pairs[f >> 57];          // D4 D5
-  f = (f & f32_chain_mask) * 100;
-  lo = lo << 16 | d.f32_pairs.pairs[f >> 57];          // D6 D7
-  f = (f & f32_chain_mask) * 100;
-  lo = lo << 16 | d.f32_pairs.pairs[f >> 57];          // D8 D9
-  // The chain left the ninth slot, byte 0, at 0; the last digit belongs there
-  // in both widths (D9 of nine digits, D8 of eight), so it is ORed in off the
-  // chain, in the shadow of the last pair load.
+  // Three steps of 3, 3 and 2 digits. The fraction only has to carry the
+  // digits still to come, so it is shortened to 54 bits once, ahead of the
+  // first * 1000, and 2^54 * 1000 fits in 64 bits: margins are 1.8e-6 against
+  // 1e-5, 1.8e-3 against 1e-2 and 0.18 against 1.
+  // Each group enters at the low end of the accumulator, which shifts up to
+  // make room: the loaded entry is used as is. The last group is a pair, and
+  // comes from the same table -- a triple's top byte is zero.
+  constexpr uint64_t m54 = (uint64_t(1) << 54) - 1;
+  uint64_t f1 = ((f >> 3) & m54) * 1000;
+  uint64_t lo = d.f32_triples.triples[f1 >> 54];        // D2 D3 D4
+  uint64_t f2 = (f1 & m54) * 1000;
+  lo = lo << 24 | d.f32_triples.triples[f2 >> 54];      // D5 D6 D7
+  uint64_t f3 = (f2 & m54) * 100;
+  lo = lo << 16 | d.f32_triples.triples[f3 >> 54];      // D8 D9
+  // The ninth slot, byte 0, is 0; the last digit belongs there in both widths
+  // (D9 of nine digits, D8 of eight), so it is ORed in off the chain.
   lo |= uint64_t(-int64_t(has_last_digit)) & uint64_t(last_digit);
 
   // lo's trailing zero bytes are the trailing zero digits; all of them zero
