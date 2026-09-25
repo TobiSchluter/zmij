@@ -69,13 +69,28 @@ static_assert(!ZMIJ_USE_AVX2 || ZMIJ_USE_SSE4_1);
 #  define ZMIJ_USE_AVX2 0
 #endif
 
+// Fused multiply-add, for the float-reciprocal digit kernels.  This is
+// a microarchtiecture level 3 feature, and usually comes paired with AVX2.
+// MSVC has no __FMA__, but /arch:AVX2 implies FMA there; clang-cl defines
+// __FMA__ when FMA is on, so it takes the first branch.
+#ifdef ZMIJ_USE_FMA
+// Use the provided definition.
+static_assert(!ZMIJ_USE_FMA || ZMIJ_USE_SSE4_1);
+#elif defined(__FMA__) || \
+    (defined(_MSC_VER) && !defined(__clang__) && defined(__AVX2__))
+#  define ZMIJ_USE_FMA ZMIJ_USE_SSE4_1
+#else
+#  define ZMIJ_USE_FMA 0
+#endif
+
 // The float-reciprocal 4-digit peel for the u64 head. A win on Zen 5, where
 // the FP digit kernel rides ports the integer chain leaves idle; a loss on
 // the Intel cores measured, whose vector and scalar ports are shared.
 #ifdef ZMIJ_USE_AVX2_U64_FP
 // Use the provided definition.
-static_assert(!ZMIJ_USE_AVX2_U64_FP || ZMIJ_USE_AVX2);
-#elif ZMIJ_USE_AVX2 && (defined(__znver5__) || defined(__tune_znver5__))
+static_assert(!ZMIJ_USE_AVX2_U64_FP || (ZMIJ_USE_AVX2 && ZMIJ_USE_FMA));
+#elif ZMIJ_USE_AVX2 && ZMIJ_USE_FMA && \
+    (defined(__znver5__) || defined(__tune_znver5__))
 #  define ZMIJ_USE_AVX2_U64_FP 1
 #else
 #  define ZMIJ_USE_AVX2_U64_FP 0
@@ -567,6 +582,8 @@ struct data {
       15,   14,   13,   12,   11,   10,   9,    8,
       0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
       0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80};
+#  endif  // ZMIJ_USE_AVX2
+#  if ZMIJ_USE_FMA
   // Sliding gather+trim for itoa_top8. The base picks the 8 top-block
   // digits MSD-first from the four /10 lanes (each 32-bit lane holds
   // [units, tens] in its low 16 bits). Loading 16 bytes at offset (8 - len)
@@ -596,7 +613,7 @@ struct data {
 #    endif  // ZMIJ_USE_AVX2_U64_FP
   alignas(16) float top8_recip[4] = {1e0f, 1e-2f, 1e-4f, 1e-6f};  // itoa_top8
   alignas(16) float hundred_ps[4] = {100.0f, 100.0f, 100.0f, 100.0f};
-#  endif  // ZMIJ_USE_AVX2
+#  endif  // ZMIJ_USE_FMA
 #endif    // ZMIJ_USE_SSE4_1
 
 #if ZMIJ_USE_NEON
@@ -1033,8 +1050,8 @@ ZMIJ_INLINE auto to_ascii16_and_shuffle(uint64_t value, const __m128i& shuffle,
                                       d);
 }
 
-// Unused under AVX2, where the u64 path uses itoa_body_lanes and the u128
-// paths use itoa_body_head16_pad / itoa_top8.
+// Unused under AVX2 + FMA, where the u64 path uses itoa_body_lanes and the
+// u128 paths use itoa_body_head16_pad / itoa_top8.
 [[ZMIJ_MAYBE_UNUSED]] ZMIJ_INLINE char* itoa_body(char* out, uint64_t value,
                                                   uint64_t len,
                                                   const data& d) noexcept {
@@ -1235,7 +1252,7 @@ ZMIJ_INLINE char* itoa_head7(char* out, uint32_t top, uint64_t len) noexcept {
 
 #endif  // ZMIJ_USE_SSE
 
-#if ZMIJ_USE_AVX2
+#if ZMIJ_USE_FMA
 // The u128 highest block: top < 1e7 (<= 7 digits, so < 2^24 and exact in f32).
 // Four base-100 blocks via the FP reciprocals -- no scalar divide -- then each
 // block split to two digits by one SWAR /10 (the same mul/shift the scalar
@@ -1266,7 +1283,7 @@ ZMIJ_INLINE char* itoa_top8(char* out, uint32_t top, uint64_t len,
                    _mm_shuffle_epi8(digs, sh));
   return out + len;
 }
-#endif  // ZMIJ_USE_AVX2
+#endif  // ZMIJ_USE_FMA
 
 #if ZMIJ_USE_INT128
 ZMIJ_INLINE auto itoa_u128(char* out, uint128_t value) noexcept -> char*;
@@ -1494,7 +1511,7 @@ auto itoa_u128_wide(char* out, uint128_t value) noexcept -> char* {
   }
   // hi.rem = digits [16, 32); hi.quot = top (<= 7 digits)
   divmod_1e16_narrow_result hi = divmod_1e16_narrow(lo.quot, *d);
-#if ZMIJ_USE_AVX2
+#if ZMIJ_USE_FMA
   char* p = itoa_top8(out, hi.quot, count_digits(hi.quot, *d), *d);
 #elif ZMIJ_USE_SSE && !ZMIJ_USE_SSE4_1
   char* p = itoa_head7(out, hi.quot, count_digits(hi.quot, *d));
