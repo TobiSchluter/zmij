@@ -757,24 +757,25 @@ constexpr uint32_t neg10 = (1 << 8) - 10;
 
 constexpr uint64_t zeros = 0x0101010101010101u * '0';
 
-// Digit pairs for the f32 fraction chain, natural order: entry i holds i / 10
-// in the low byte and i % 10 in the high byte. The chain emits pairs most
-// significant first, so accumulating them with ascending shifts lays the digits
-// down in print order, which is what the layout shuffle indexes. Raw BCD, not
-// ASCII; the '0' bias is ORed in once over the whole register.
+// Digit pairs for the f32 fraction chain, reversed: entry i holds i % 10 in
+// the low byte and i / 10 in the high byte. The chain emits pairs most
+// significant first and shifts its accumulator up to make room for each next
+// one, so the digits come out byte-reversed -- the last in byte 0 -- and the
+// layout shuffle indexes them that way. Raw BCD, not ASCII; the '0' bias is
+// ORed in once over the whole register.
 struct f32_pair_table {
   uint16_t pairs[100] = {};
   constexpr f32_pair_table() {
     for (int i = 0; i < 100; ++i)
-      pairs[i] = uint16_t((i / 10) | ((i % 10) << 8));
+      pairs[i] = uint16_t((i % 10) | ((i / 10) << 8));
   }
 };
 
 // Shuffle vectors that lay the chain's digits out in either notation.
 //
 // Source register assembled by write_float32_chain:
-//   bytes [0, 8):                  lo -- D2..D9 with the extra digit, D1..D8
-//                                  without -- ASCII, print order
+//   bytes [0, 8):                  lo -- D9..D2 with the extra digit, D8..D1
+//                                  without -- ASCII, byte-reversed
 //   bytes [exp_pos, exp_pos + 4):  exponent string "e+NN" / "e-NN"
 //   byte  d1_pos:                  D1 with the extra digit ('0', unused,
 //                                  without)
@@ -819,7 +820,7 @@ struct f32_chain_shuffle_table {
   // Source position of digit k, counted from 1.
   static constexpr auto digit_pos(bool has_extra_digit, int k) noexcept
       -> int {
-    return has_extra_digit ? (k == 1 ? d1_pos : k - 2) : k - 1;
+    return has_extra_digit ? (k == 1 ? d1_pos : 9 - k) : 8 - k;
   }
 
   static ZMIJ_CONSTEXPR auto make() -> f32_chain_shuffle_table {
@@ -1278,23 +1279,25 @@ ZMIJ_INLINE auto write_float32_chain(char* buffer, long long sig,
   // The leading slot's pair index is 10 * sig / 1e8: D1 with the extra digit,
   // 0 without. It goes into the tail register on its own, added to the '0'
   // the exponent entry carries there, which frees lo to hold the next eight
-  // digits exactly.
+  // digits exactly. The accumulator is what shifts, not the pair: lo is ready
+  // long before each next pair arrives, so after the last pair load only the
+  // OR remains on the path.
   uint64_t d1 = f >> 57;
   f = (f & f32_chain_mask) * 100;
   uint64_t lo = d.f32_pairs.pairs[f >> 57];            // D2 D3
   f = (f & f32_chain_mask) * 100;
-  lo |= uint64_t(d.f32_pairs.pairs[f >> 57]) << 16;    // D4 D5
+  lo = lo << 16 | d.f32_pairs.pairs[f >> 57];          // D4 D5
   f = (f & f32_chain_mask) * 100;
-  lo |= uint64_t(d.f32_pairs.pairs[f >> 57]) << 32;    // D6 D7
+  lo = lo << 16 | d.f32_pairs.pairs[f >> 57];          // D6 D7
   f = (f & f32_chain_mask) * 100;
-  lo |= uint64_t(d.f32_pairs.pairs[f >> 57]) << 48;    // D8 D9
-  // The chain left the ninth slot at 0; the last digit belongs there in both
-  // widths (D9 of nine digits, D8 of eight), so it is ORed in off the chain,
-  // in the shadow of the last pair load.
-  lo |= (uint64_t(-int64_t(has_last_digit)) & uint64_t(last_digit)) << 56;
+  lo = lo << 16 | d.f32_pairs.pairs[f >> 57];          // D8 D9
+  // The chain left the ninth slot, byte 0, at 0; the last digit belongs there
+  // in both widths (D9 of nine digits, D8 of eight), so it is ORed in off the
+  // chain, in the shadow of the last pair load.
+  lo |= uint64_t(-int64_t(has_last_digit)) & uint64_t(last_digit);
 
-  // lo's leading zero bytes are the trailing zero digits; all of them zero
-  // means D1 stands alone, which lzcnt's count of 64 for 0 lands on by itself
+  // lo's trailing zero bytes are the trailing zero digits; all of them zero
+  // means D1 stands alone, which tzcnt's count of 64 for 0 lands on by itself
   // -- no select, no branch. A branch here mispredicts every tenth call on a
   // realistic digit mix. >> 3, not / 8: the count is never negative, so no
   // signed-division fixup on the path feeding the end_pos load. lo holds
@@ -1302,16 +1305,18 @@ ZMIJ_INLINE auto write_float32_chain(char* buffer, long long sig,
   // Unsigned, and the table index below pointer-sized, so the count widens
   // for free and the table offsets fold into the loads' addressing modes.
   unsigned num_digits = 8u + has_extra_digit;
-#if ZMIJ_HAS_BUILTIN(__builtin_clzg) && (defined(__LZCNT__) || defined(__clang__))
-  // Lowered to a bare instruction in these configurations: lzcnt, or clang's
-  // bsr into a preset register. Not gcc without LZCNT, which expands clzg as
-  // `test; je; bsr` -- exactly the branch this is avoiding.
-  num_digits -= unsigned(__builtin_clzg(lo, 64)) >> 3;
-#elif defined(__LZCNT__)
-  num_digits -= unsigned(_lzcnt_u64(lo)) >> 3;
+#if ZMIJ_HAS_BUILTIN(__builtin_ctzg) && (defined(__BMI__) || defined(__clang__))
+  // Lowered to a bare instruction in these configurations: tzcnt, or clang's
+  // bsf into a preset register. Not gcc without BMI, which expands ctzg as
+  // `test; je; bsf` -- exactly the branch this is avoiding.
+  num_digits -= unsigned(__builtin_ctzg(lo, 64)) >> 3;
+#elif defined(__BMI__)
+  num_digits -= unsigned(_tzcnt_u64(lo)) >> 3;
 #else
-  // lo | 1 pins clz to at most 63; gcc turns the zero correction into cmp/sbb.
-  num_digits -= (unsigned(clz(lo | 1)) >> 3) + unsigned(lo == 0);
+  // Setting bit 63 (never a BCD bit) pins ctz to at most 63; gcc turns the
+  // zero correction into cmp/sbb.
+  num_digits -= (unsigned(ctz(lo | (uint64_t(1) << 63))) >> 3) +
+                unsigned(lo == 0);
 #endif
 
   // Everything but lo is known before it is: the exponent entry, which carries
