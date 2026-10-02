@@ -454,12 +454,10 @@ struct exp_string_table {
     exp_string_table t;
     for (int e = min_dec_exp; e <= traits::max_exponent10 && enable; ++e) {
       uint64_t abs_e = e >= 0 ? e : -e;
-      uint64_t bc = abs_e % 100;
-      uint64_t val = ((bc % 10 + '0') << 8) | (bc / 10 + '0');
-      if (uint64_t a = abs_e / 100)
-        val = (val << 8) | (a + '0');
-      else
-        val |= uint64_t('0') << 16;
+      // Left-aligning a two-digit exponent pads it with the '0' byte 4 holds.
+      uint64_t ddd = abs_e < 100 ? abs_e * 10 : abs_e;
+      uint64_t val = (ddd / 100 + '0') | ((ddd / 10 % 10 + '0') << 8) |
+                     ((ddd % 10 + '0') << 16);
       uint64_t len = 4 + (abs_e >= 100);
       // Bytes: 'e', sign, two digits, a third digit or '0', '.', '0', length.
       // The float emitters insert an entry whole and add their last digit to
