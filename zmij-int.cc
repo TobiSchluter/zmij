@@ -4,11 +4,13 @@
 // Distributed under the MIT license (see LICENSE) or alternatively
 // the Boost Software License, Version 1.0.
 //
-// Self-contained: shares only zmij.h with the floating-point implementation.
+// Self-contained: shares only zmij.h and zmij-shared.h with the floating-point
+// implementation.
 // Kernels are selected by ISA: NEON, SSE4.1 (+ AVX2 wide paths and, on Zen 5,
 // the float-reciprocal u64 split), plain SSE2, and a scalar SWAR fallback.
 
 #include "zmij.h"
+#include "zmij-shared.h"
 
 #include <assert.h>  // assert
 #include <stddef.h>  // offsetof
@@ -16,72 +18,6 @@
 #include <string.h>  // memcpy
 
 #include <type_traits>  // std::make_unsigned, std::conditional_t
-
-// The configuration macros below mirror zmij.cc so that both files compile
-// standalone with the same settings; identical redefinitions keep unity
-// builds that include both files valid.
-
-#ifndef ZMIJ_USE_SIMD
-#  define ZMIJ_USE_SIMD 1
-#endif
-
-#ifdef ZMIJ_USE_NEON
-// Use the provided definition.
-#elif defined(__ARM_NEON) || defined(_M_ARM64)
-#  define ZMIJ_USE_NEON ZMIJ_USE_SIMD
-#else
-#  define ZMIJ_USE_NEON 0
-#endif
-#if ZMIJ_USE_NEON
-#  include <arm_neon.h>
-#endif
-
-#ifdef ZMIJ_USE_SSE
-// Use the provided definition.
-#elif defined(__SSE2__)
-#  define ZMIJ_USE_SSE ZMIJ_USE_SIMD
-#elif defined(_M_AMD64) || (defined(_M_IX86_FP) && _M_IX86_FP == 2)
-#  define ZMIJ_USE_SSE ZMIJ_USE_SIMD
-#else
-#  define ZMIJ_USE_SSE 0
-#endif
-#if ZMIJ_USE_SSE
-#  include <immintrin.h>
-#endif
-
-#ifdef ZMIJ_USE_SSE4_1
-// Use the provided definition.
-static_assert(!ZMIJ_USE_SSE4_1 || ZMIJ_USE_SSE);
-#elif defined(__SSE4_1__) || defined(__AVX__)
-// On MSVC there's no way to check for SSE4.1 specifically so check __AVX__.
-#  define ZMIJ_USE_SSE4_1 ZMIJ_USE_SSE
-#else
-#  define ZMIJ_USE_SSE4_1 0
-#endif
-
-// 256-bit paths for the u128 body chunks.
-#ifdef ZMIJ_USE_AVX2
-// Use the provided definition.
-static_assert(!ZMIJ_USE_AVX2 || ZMIJ_USE_SSE4_1);
-#elif defined(__AVX2__)
-#  define ZMIJ_USE_AVX2 ZMIJ_USE_SSE4_1
-#else
-#  define ZMIJ_USE_AVX2 0
-#endif
-
-// Fused multiply-add, for the float-reciprocal digit kernels.  This is
-// a microarchtiecture level 3 feature, and usually comes paired with AVX2.
-// MSVC has no __FMA__, but /arch:AVX2 implies FMA there; clang-cl defines
-// __FMA__ when FMA is on, so it takes the first branch.
-#ifdef ZMIJ_USE_FMA
-// Use the provided definition.
-static_assert(!ZMIJ_USE_FMA || ZMIJ_USE_SSE4_1);
-#elif defined(__FMA__) || \
-    (defined(_MSC_VER) && !defined(__clang__) && defined(__AVX2__))
-#  define ZMIJ_USE_FMA ZMIJ_USE_SSE4_1
-#else
-#  define ZMIJ_USE_FMA 0
-#endif
 
 // The float-reciprocal 4-digit peel for the u64 head. A win on Zen 5, where
 // the FP digit kernel rides ports the integer chain leaves idle; a loss on
@@ -109,76 +45,12 @@ static_assert(!ZMIJ_USE_AVX2_U64_FP || (ZMIJ_USE_AVX2 && ZMIJ_USE_FMA));
 #  define ZMIJ_USE_U64_SPLIT12 0
 #endif
 
-#ifdef __x86_64__
-#  define ZMIJ_X86_64 1
-#else
-#  define ZMIJ_X86_64 0
-#endif
-
-#ifdef _MSC_VER
-#  define ZMIJ_MSC_VER _MSC_VER
-#else
-#  define ZMIJ_MSC_VER 0
-#endif
-
-#if defined(__has_builtin) && !defined(ZMIJ_NO_BUILTINS)
-#  define ZMIJ_HAS_BUILTIN(x) __has_builtin(x)
-#else
-#  define ZMIJ_HAS_BUILTIN(x) 0
-#endif
-#ifdef __has_attribute
-#  define ZMIJ_HAS_ATTRIBUTE(x) __has_attribute(x)
-#else
-#  define ZMIJ_HAS_ATTRIBUTE(x) 0
-#endif
-#ifdef __has_cpp_attribute
-#  define ZMIJ_HAS_CPP_ATTRIBUTE(x) __has_cpp_attribute(x)
-#else
-#  define ZMIJ_HAS_CPP_ATTRIBUTE(x) 0
-#endif
-
-#if ZMIJ_HAS_CPP_ATTRIBUTE(likely) && ZMIJ_HAS_CPP_ATTRIBUTE(unlikely)
-#  define ZMIJ_LIKELY likely
-#  define ZMIJ_UNLIKELY unlikely
-#else
-#  define ZMIJ_LIKELY
-#  define ZMIJ_UNLIKELY
-#endif
-
-#if ZMIJ_HAS_CPP_ATTRIBUTE(maybe_unused)
-#  define ZMIJ_MAYBE_UNUSED maybe_unused
-#else
-#  define ZMIJ_MAYBE_UNUSED
-#endif
-
-#ifdef ZMIJ_OPTIMIZE_SIZE
-// Use the provided definition.
-#elif defined(__OPTIMIZE_SIZE__)
-#  define ZMIJ_OPTIMIZE_SIZE 1
-#else
-#  define ZMIJ_OPTIMIZE_SIZE 0
-#endif
-
-#if ZMIJ_HAS_ATTRIBUTE(always_inline) && !ZMIJ_OPTIMIZE_SIZE
-#  define ZMIJ_INLINE __attribute__((always_inline)) inline
-#elif ZMIJ_MSC_VER
-#  define ZMIJ_INLINE __forceinline
-#else
-#  define ZMIJ_INLINE inline
-#endif
-
 #if ZMIJ_HAS_ATTRIBUTE(noinline)
 #  define ZMIJ_NOINLINE __attribute__((noinline))
 #elif ZMIJ_MSC_VER
 #  define ZMIJ_NOINLINE __declspec(noinline)
 #else
 #  define ZMIJ_NOINLINE
-#endif
-
-#ifdef __GNUC__
-#  define ZMIJ_ASM(x) asm x
-#else
-#  define ZMIJ_ASM(x)
 #endif
 
 // Whether check_room can see the destination's size (see itoa).
