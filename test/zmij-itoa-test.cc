@@ -51,6 +51,13 @@ template <typename T> constexpr auto buffer_size() -> size_t {
                           : size_t(zmij::uint128_buffer_size);
 }
 
+// Returns the offset of the first byte in [p, p + n) other than '?', or n.
+auto find_clobbered(const char* p, size_t n) -> size_t {
+  size_t i = 0;
+  while (i < n && p[i] == '?') ++i;
+  return i;
+}
+
 // Formats value with zmij::write into an exactly buffer_size<T>()-sized
 // buffer and verifies the bytes before and past it stay untouched.
 template <typename T> auto zmij_to_string(T value) -> std::string {
@@ -59,13 +66,11 @@ template <typename T> auto zmij_to_string(T value) -> std::string {
   memset(storage, '?', sizeof(storage));
   char* buffer = storage + 8;
   char* end = zmij::write(buffer, size, value);
-  for (size_t i = 0; i < 8; ++i) {
-    EXPECT_EQ(storage[i], '?') << "buffer underrun at offset "
-                               << ptrdiff_t(i) - 8;
-  }
-  for (size_t i = 8 + size; i < sizeof(storage); ++i) {
-    EXPECT_EQ(storage[i], '?') << "buffer overrun at offset " << i - 8;
-  }
+  size_t under = find_clobbered(storage, 8);
+  EXPECT_EQ(under, size_t(8))
+      << "buffer underrun at offset " << ptrdiff_t(under) - 8;
+  size_t over = find_clobbered(buffer + size, 8);
+  EXPECT_EQ(over, size_t(8)) << "buffer overrun at offset " << size + over;
   return std::string(buffer, end);
 }
 
@@ -88,14 +93,25 @@ template <typename T> auto to_value(candidate c) -> T {
   return T(bits);
 }
 
-// All powers of two and ten representable in wide_uint, each with both
-// adjacent values, both signs, plus zero and T's min/max and their neighbors.
+// How far around each boundary to test.
+constexpr int boundary_radius = 100;
+
+// All powers of two and ten representable in wide_uint, both signs, plus zero
+// and T's min/max, each with all values within boundary_radius of it.
 template <typename T> auto boundary_candidates() -> std::vector<candidate> {
   std::vector<candidate> result;
   auto add = [&result](wide_uint magnitude, bool negative) {
-    result.push_back(candidate{magnitude, negative});
-    if (magnitude > 0) result.push_back(candidate{magnitude - 1, negative});
-    result.push_back(candidate{magnitude + 1, negative});
+    for (int d = -boundary_radius; d <= boundary_radius; ++d) {
+      wide_uint delta = wide_uint(d < 0 ? -d : d);
+      if ((d > 0) != negative) {  // Away from zero: the magnitude grows.
+        if (magnitude <= ~wide_uint(0) - delta)
+          result.push_back(candidate{magnitude + delta, negative});
+      } else if (delta <= magnitude) {
+        result.push_back(candidate{magnitude - delta, negative});
+      } else {  // Crosses zero.
+        result.push_back(candidate{delta - magnitude, !negative});
+      }
+    }
   };
   add(0, false);
   for (int k = 0; k < int(sizeof(wide_uint)) * 8; ++k) {
@@ -106,7 +122,7 @@ template <typename T> auto boundary_candidates() -> std::vector<candidate> {
     add(p, false);
     add(p, true);
   }
-  // min and max of T. add() also covers min + 1 and max - 1.
+  // min and max of T.
   add(max_magnitude<T>(), false);
   add(is_signed_int<T>() ? max_magnitude<T>() + 1 : 0, is_signed_int<T>());
   return result;
@@ -127,7 +143,7 @@ TYPED_TEST(itoa_test, boundary_values) {
   for (candidate c : boundary_candidates<TypeParam>()) {
     if (!in_range<TypeParam>(c)) continue;
     TypeParam value = to_value<TypeParam>(c);
-    EXPECT_EQ(zmij_to_string(value), fmt::format("{}", value));
+    EXPECT_EQ(zmij_to_string(value), fmt::to_string(value));
   }
 }
 

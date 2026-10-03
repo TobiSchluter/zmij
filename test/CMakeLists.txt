@@ -59,11 +59,6 @@ add_executable(float-check float-check.cc)
 target_compile_features(float-check PRIVATE ${ZMIJ_CHECK_STANDARD})
 target_link_libraries(float-check fmt dragonbox zmij)
 
-# Exhaustive 32-bit integer check; standalone like float-check, run manually.
-add_executable(int-check int-check.cc)
-target_compile_features(int-check PRIVATE ${ZMIJ_CHECK_STANDARD})
-target_link_libraries(int-check fmt zmij Threads::Threads)
-
 include(FetchContent)
 set(BENCHMARK_ENABLE_TESTING OFF CACHE BOOL "" FORCE)
 set(BENCHMARK_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
