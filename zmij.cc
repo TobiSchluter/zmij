@@ -5,7 +5,6 @@
 // the Boost Software License, Version 1.0.
 
 #include "zmij.h"
-#include "zmij-shared.h"
 
 #include <assert.h>  // assert
 #include <float.h>   // DBL_MANT_DIG, LDBL_MANT_DIG
@@ -16,6 +15,13 @@
 
 #include <limits>       // std::numeric_limits
 #include <type_traits>  // std::conditional
+
+#if ZMIJ_USE_NEON
+#  include <arm_neon.h>
+#endif
+#if ZMIJ_USE_SSE
+#  include <immintrin.h>
+#endif
 
 #ifdef __aarch64__
 #  define ZMIJ_AARCH64 1

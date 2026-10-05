@@ -4,13 +4,11 @@
 // Distributed under the MIT license (see LICENSE) or alternatively
 // the Boost Software License, Version 1.0.
 //
-// Self-contained: shares only zmij.h and zmij-shared.h with the floating-point
-// implementation.
+// Self-contained: shares only zmij.h with the floating-point implementation.
 // Kernels are selected by ISA: NEON, SSE4.1 (+ AVX2 wide paths and, on Zen 5,
 // the float-reciprocal u64 split), plain SSE2, and a scalar SWAR fallback.
 
 #include "zmij.h"
-#include "zmij-shared.h"
 
 #include <assert.h>  // assert
 #include <stddef.h>  // offsetof
@@ -18,6 +16,13 @@
 #include <string.h>  // memcpy
 
 #include <type_traits>  // std::make_unsigned, std::conditional_t
+
+#if ZMIJ_USE_NEON
+#  include <arm_neon.h>
+#endif
+#if ZMIJ_USE_SSE
+#  include <immintrin.h>
+#endif
 
 // The u64 kernel (see itoa): the 20-digit grid as five 4-digit groups from
 // two 128-bit products, two group chains running side by side in the two
