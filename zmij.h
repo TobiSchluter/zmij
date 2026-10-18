@@ -294,16 +294,14 @@ inline ZMIJ_CONSTEXPR auto umul128(uint64_t x, uint64_t y) noexcept
 #if ZMIJ_USE_INT128
   return uint128_t(x) * y;
 #else
-#  if ZMIJ_USE_IS_CONSTANT_EVALUATED
+#  if ZMIJ_USE_IS_CONSTANT_EVALUATED && defined(_M_AMD64)
   if (!is_constant_evaluated()) {
-#    if defined(_M_AMD64)
     uint64_t hi = 0;
     uint64_t lo = _umul128(x, y, &hi);
     return {hi, lo};
-#    elif defined(_M_ARM64)
-    return {__umulh(x, y), x * y};
-#    endif
   }
+#  elif ZMIJ_USE_IS_CONSTANT_EVALUATED && defined(_M_ARM64)
+  if (!is_constant_evaluated()) return {__umulh(x, y), x * y};
 #  endif
   uint64_t a = x >> 32;
   uint64_t b = uint32_t(x);
