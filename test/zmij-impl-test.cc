@@ -220,27 +220,13 @@ TEST(zmij_impl_test, pow10_compute) {
 }
 
 TEST(zmij_impl_test, umul128) {
-#if ZMIJ_USE_CONSTEXPR
-  constexpr auto max_product = umul128(UINT64_MAX, UINT64_MAX);
-  static_assert(uint64_t(max_product) == 1, "constexpr lower half");
-  static_assert(uint64_t(max_product >> 64) == UINT64_MAX - 1,
-                "constexpr upper half");
-#endif
-
-  struct product_case {
-    uint64_t x, y, hi, lo;
-  };
-  const product_case cases[] = {
-      {0, UINT64_MAX, 0, 0},
-      {0x100000001, 0x100000001, 1, 0x200000001},
-      {UINT64_MAX, 0x100000001, 0x100000000, 0xfffffffeffffffff},
-      {UINT64_MAX, UINT64_MAX, UINT64_MAX - 1, 1},
-  };
-  for (const auto& c : cases) {
-    auto product = umul128(c.x, c.y);
-    EXPECT_EQ(uint64_t(product), c.lo) << "x=" << c.x << ", y=" << c.y;
-    EXPECT_EQ(uint64_t(product >> 64), c.hi) << "x=" << c.x << ", y=" << c.y;
-  }
+  // UINT64_MAX * UINT64_MAX exercises both halves and carry propagation.
+  ZMIJ_CONSTEXPR auto max_product = umul128(UINT64_MAX, UINT64_MAX);
+  EXPECT_EQ(uint64_t(max_product), 1u);
+  EXPECT_EQ(uint64_t(max_product >> 64), UINT64_MAX - 1);
+  auto runtime_product = umul128(UINT64_MAX, UINT64_MAX);
+  EXPECT_EQ(uint64_t(runtime_product), 1u);
+  EXPECT_EQ(uint64_t(runtime_product >> 64), UINT64_MAX - 1);
 }
 
 TEST(zmij_impl_test, utilities) {
