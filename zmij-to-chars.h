@@ -176,6 +176,7 @@ auto to_chars(char* first, char* last, Float value, chars_format fmt,
   return copy_to_chars(first, last, buffer, end);
 }
 
+#if ZMIJ_USE_LONG_DOUBLE
 template <>
 inline auto to_chars(char* first, char* last, long double value,
                      chars_format fmt, int precision) -> to_chars_result {
@@ -187,6 +188,7 @@ inline auto to_chars(char* first, char* last, long double value,
   if (size == 0) return {first, std::errc::not_enough_memory};
   return to_chars_end(first, last, size);
 }
+#endif  // ZMIJ_USE_LONG_DOUBLE
 
 // Writes `value` in its shortest form in the given `fmt` to [`first`, `last`),
 // like std::to_chars with a format but no precision.
@@ -237,6 +239,7 @@ inline auto to_chars(char* first, char* last, double value) -> to_chars_result {
   return detail::copy_to_chars(first, last, buffer,
                                detail::write(buffer, value));
 }
+#if ZMIJ_USE_LONG_DOUBLE
 inline auto to_chars(char* first, char* last, long double value)
     -> to_chars_result {
   if (LDBL_MANT_DIG == DBL_MANT_DIG)
@@ -244,6 +247,7 @@ inline auto to_chars(char* first, char* last, long double value)
   size_t size = detail::write_big(first, size_t(last - first), value);
   return detail::to_chars_end(first, last, size);
 }
+#endif  // ZMIJ_USE_LONG_DOUBLE
 
 /// Writes the shortest representation of `value` in the given `fmt` to
 /// [`first`, `last`), like std::to_chars with a format but no precision.
@@ -267,10 +271,12 @@ inline auto to_chars(char* first, char* last, double value, chars_format fmt)
     -> to_chars_result {
   return detail::to_chars(first, last, value, fmt);
 }
+#if ZMIJ_USE_LONG_DOUBLE
 inline auto to_chars(char* first, char* last, long double value,
                      chars_format fmt) -> to_chars_result {
   return detail::to_chars(first, last, value, fmt);
 }
+#endif  // ZMIJ_USE_LONG_DOUBLE
 
 /// Writes `value` to [`first`, `last`) in the given `fmt` with `precision`
 /// digits, like std::to_chars with a format and precision. `precision` counts
@@ -311,6 +317,7 @@ inline auto to_chars(char* first, char* last, double value, chars_format fmt,
 ///   writing a truncated result to [`first`, `last`);
 /// - {last, std::errc::not_enough_memory} on allocation failure (only possible
 ///   for an extended long double).
+#if ZMIJ_USE_LONG_DOUBLE
 inline auto to_chars(char* first, char* last, long double value,
                      chars_format fmt, int precision) -> to_chars_result {
   if (double(value) == value)
@@ -319,6 +326,7 @@ inline auto to_chars(char* first, char* last, long double value,
              ? detail::to_chars_hex(first, last, value, precision)
              : detail::to_chars(first, last, value, fmt, precision);
 }
+#endif  // ZMIJ_USE_LONG_DOUBLE
 
 }  // namespace zmij
 

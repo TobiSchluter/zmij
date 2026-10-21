@@ -806,6 +806,7 @@ TEST(double_test, write_big_reports_true_length) {
   EXPECT_EQ(needed, expected);                // true length, > capacity
 }
 
+#if ZMIJ_USE_LONG_DOUBLE
 TEST(long_double_test, to_decimal) {
   using limits = std::numeric_limits<long double>;
 
@@ -1102,6 +1103,7 @@ TEST(long_double_test, write_shortest) {
     check(-misround);
   }
 }
+#endif  // ZMIJ_USE_LONG_DOUBLE
 
 #endif  // !ZMIJ_C
 
@@ -1199,7 +1201,7 @@ TEST(double_test, write_hex_no_buffer) {
   EXPECT_EQ(std::string(buf, end), "-0x1");
 }
 
-#if !ZMIJ_C
+#if !ZMIJ_C && ZMIJ_USE_LONG_DOUBLE
 // Double-exact values so the expected output is the same whether long double
 // is x87 80-bit, IEEE binary128, or plain double. This is not compared against
 // snprintf's %La: glibc's 80-bit %La uses a non-leading-1 form (e.g. "0xcp-3"
@@ -1213,7 +1215,7 @@ TEST(long_double_test, write_hex) {
   EXPECT_EQ(to_hex(3.25L), "0x1.ap+1");
 }
 
-#endif  // !ZMIJ_C
+#endif  // !ZMIJ_C && ZMIJ_USE_LONG_DOUBLE
 
 auto main(int argc, char** argv) -> int {
   testing::InitGoogleTest(&argc, argv);
