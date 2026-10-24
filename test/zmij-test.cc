@@ -166,6 +166,11 @@ static auto to_fixed(double value, int precision) -> std::string {
   return {buffer, zmij::write_fixed(buffer, sizeof(buffer), value, precision)};
 }
 
+template <typename Float> static auto to_hex(Float value) -> std::string {
+  char buffer[zmij::buffer_sizes<Float>::hex];
+  return {buffer, zmij::write_hex(buffer, sizeof(buffer), value)};
+}
+
 #if !ZMIJ_C
 TEST(float_test, to_chars) {
   char buffer[zmij::float_buffer_size];
@@ -1103,6 +1108,19 @@ TEST(long_double_test, write_shortest) {
     check(-misround);
   }
 }
+
+// Double-exact values so the expected output is the same whether long double
+// is x87 80-bit, IEEE binary128, or plain double. This is not compared against
+// snprintf's %La: glibc's 80-bit %La uses a non-leading-1 form (e.g. "0xcp-3"
+// for 1.5), whereas write_hex always normalizes to a leading 0x1.
+TEST(long_double_test, write_hex) {
+  EXPECT_EQ(to_hex(1.5L), "0x1.8p+0");
+  EXPECT_EQ(to_hex(-2.0L), "-0x1p+1");
+  EXPECT_EQ(to_hex(0.5L), "0x1p-1");
+  EXPECT_EQ(to_hex(0.0L), "0x0p+0");
+  EXPECT_EQ(to_hex(1024.0L), "0x1p+10");
+  EXPECT_EQ(to_hex(3.25L), "0x1.ap+1");
+}
 #endif  // ZMIJ_USE_LONG_DOUBLE
 
 #endif  // !ZMIJ_C
@@ -1161,11 +1179,6 @@ TEST(double_test, write_general_irregular) {
   }
 }
 
-template <typename Float> static auto to_hex(Float value) -> std::string {
-  char buffer[zmij::buffer_sizes<Float>::hex];
-  return {buffer, zmij::write_hex(buffer, sizeof(buffer), value)};
-}
-
 TEST(float_test, write_hex) {
   EXPECT_EQ(to_hex(1.0f), "0x1p+0");
   EXPECT_EQ(to_hex(-3.5f), "-0x1.cp+1");
@@ -1200,22 +1213,6 @@ TEST(double_test, write_hex_no_buffer) {
   char* end = zmij::write_hex(buf, sizeof(buf), -1.5);
   EXPECT_EQ(std::string(buf, end), "-0x1");
 }
-
-#if !ZMIJ_C && ZMIJ_USE_LONG_DOUBLE
-// Double-exact values so the expected output is the same whether long double
-// is x87 80-bit, IEEE binary128, or plain double. This is not compared against
-// snprintf's %La: glibc's 80-bit %La uses a non-leading-1 form (e.g. "0xcp-3"
-// for 1.5), whereas write_hex always normalizes to a leading 0x1.
-TEST(long_double_test, write_hex) {
-  EXPECT_EQ(to_hex(1.5L), "0x1.8p+0");
-  EXPECT_EQ(to_hex(-2.0L), "-0x1p+1");
-  EXPECT_EQ(to_hex(0.5L), "0x1p-1");
-  EXPECT_EQ(to_hex(0.0L), "0x0p+0");
-  EXPECT_EQ(to_hex(1024.0L), "0x1p+10");
-  EXPECT_EQ(to_hex(3.25L), "0x1.ap+1");
-}
-
-#endif  // !ZMIJ_C && ZMIJ_USE_LONG_DOUBLE
 
 auto main(int argc, char** argv) -> int {
   testing::InitGoogleTest(&argc, argv);
