@@ -1630,8 +1630,22 @@ auto write(char* buffer, Float value) noexcept -> char* {
       dec = {dec_sig * pow10s[num_zeros], dec.exp - num_zeros - 1, 0, false};
     }
   } else {
-    dec = ::to_decimal<Float>(bin_sig | traits::implicit_bit, bin_exp,
-                              bin_sig != 0, *d);
+    // Powers of two 2**-23..2**23 take the regular path: it gives the same
+    // result there, and small integers such as 1, 2, 4 no longer mispredict.
+    // Both conditions in one compare: drop the sign, add k to the exponent
+    // field (mod 2**num_exp_bits) to move 2**-23..2**23 to the top of it, and
+    // rotate it below the significand, so anything with a nonzero significand
+    // or such an exponent compares >= the top num_in_range exponents.
+    using uint = decltype(bits);
+    constexpr int exp_bits = traits::num_exp_bits;
+    constexpr uint num_in_range = 47, min_in_range = traits::exp_bias - 23;
+    constexpr uint k = ((uint(1) << exp_bits) - num_in_range - min_in_range) &
+                       traits::exp_mask;
+    uint t = (bits << 1) + (k << (traits::num_bits - exp_bits));
+    uint r = t << exp_bits | t >> (traits::num_bits - exp_bits);
+    bool regular = r >= (uint(1) << exp_bits) - num_in_range;
+    dec = ::to_decimal<Float>(bin_sig | traits::implicit_bit, bin_exp, regular,
+                              *d);
   }
   bool has_last_digit = dec.has_last_digit;
   bool has_extra_digit = dec.sig >= threshold;
