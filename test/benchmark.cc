@@ -110,10 +110,23 @@ static void run_to_chars(benchmark::State& state,
                              benchmark::Counter::kInvert);
 }
 
-template <typename T>
+// Whole numbers in [-100, 100]: common in real data, and the powers of two
+// among them have irregular (asymmetric) rounding intervals.
+template <typename T> auto get_small_int_pool() -> const std::vector<T>& {
+  static const std::vector<T> pool = [] {
+    std::mt19937 rng(0);
+    std::uniform_int_distribution<int> dist(-100, 100);
+    std::vector<T> v(num_per_digit);
+    for (T& x : v) x = static_cast<T>(dist(rng));
+    return v;
+  }();
+  return pool;
+}
+
+template <typename T, const std::vector<T>& (*get_pool)() = get_mixed_pool<T>>
 static void run_to_chars_mixed(benchmark::State& state,
                                auto (*to_chars)(T, char*)->char*) {
-  const auto& pool = get_mixed_pool<T>();
+  const auto& pool = get_pool();
   char buffer[256];
   for (auto _ : state) {
     for (T x : pool) {
@@ -273,6 +286,10 @@ template <typename T> static void register_all(bool per_digit) {
       }
     }
     benchmark::RegisterBenchmark(m.name.c_str(), run_to_chars_mixed<T>,
+                                 m.to_chars);
+    auto si_name = m.name + "/small_int";
+    benchmark::RegisterBenchmark(si_name.c_str(),
+                                 run_to_chars_mixed<T, get_small_int_pool<T>>,
                                  m.to_chars);
     if constexpr (std::is_same_v<T, double>) {
       auto canada_name = m.name + "/canada";
