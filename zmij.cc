@@ -24,6 +24,21 @@
 #  include <emmintrin.h>
 #endif
 
+// vpermt2b on 256-bit vectors, for the double significand. The 256-bit form
+// also needs AVX-512 VL.
+#ifdef ZMIJ_USE_AVX512VBMI
+// Use the provided definition.
+static_assert(!ZMIJ_USE_AVX512VBMI || ZMIJ_USE_SSE4_1,
+              "AVX-512 VBMI requires SSE4.1");
+#elif defined(__AVX512VBMI__) && defined(__AVX512VL__)
+#  define ZMIJ_USE_AVX512VBMI ZMIJ_USE_SSE4_1
+#else
+#  define ZMIJ_USE_AVX512VBMI 0
+#endif
+#if ZMIJ_USE_AVX512VBMI
+#  include <immintrin.h>
+#endif
+
 #ifdef __aarch64__
 #  define ZMIJ_AARCH64 1
 #else
@@ -283,7 +298,12 @@ struct pow10_significand_table {
     return ~((split_tables ? num_pow10s - 1 - row : row) + dec_exp_min);
   }
   ZMIJ_CONSTEXPR20 auto by_row(size_t row) const noexcept -> uint128 {
-    if (!split_tables) return {data[row * 2], data[row * 2 + 1]};
+    if (!split_tables) {
+      // Both halves off one pointer: clang otherwise computes each index on
+      // its own instead of addressing the low half at +8.
+      const uint64_t* p = data + row * 2;
+      return {p[0], p[1]};
+    }
     // A register base per half keeps both loads indexed by the row itself,
     // instead of sharing an add of the row that the high half would wait on.
     const uint64_t* hi = data;
@@ -768,6 +788,214 @@ constexpr uint32_t neg10_u32 = (1 << 8) - 10;
 
 constexpr uint64_t zeros = 0x0101010101010101u * '0';
 
+// The display exponent and digit count of a double's shortest significand by
+// raw exponent and binary significand, like float_exp_table: an entry holds a
+// threshold in its low 52 bits, so that adding the significand carries into
+// the code above:
+//   code = 2 * (dec_exp - min_dec_exp) + has_extra_digit
+// where dec_exp is the exponent of the leading digit of a 16-digit significand.
+// has_extra_digit is integral >= 10**15 in to_decimal, after the round-up.
+// data[raw_exp] is expCodeEntry (raw_exp - 1075) in Zmij.lean, and
+// exp_code_eq there proves that (data[raw_exp] + bin_sig) >> 52 is the code
+// for every regular bin_sig with the implicit bit set.
+struct double_exp_table {
+  static constexpr bool enable = exp_shift_table::enable;
+  static constexpr int min_dec_exp = -330;
+  static constexpr int num_sig_bits = 52;
+
+  static constexpr auto encode(int dec_exp, bool has_extra_digit) noexcept
+      -> unsigned {
+    return unsigned(2 * (dec_exp - min_dec_exp) + has_extra_digit);
+  }
+  static constexpr auto has_extra_digit(unsigned code) noexcept -> bool {
+    return (code & 1) != 0;
+  }
+  // The exponent of the leading digit.
+  static constexpr auto dec_exp(unsigned code) noexcept -> int {
+    return int((code + 1) >> 1) + min_dec_exp;
+  }
+
+  uint64_t data[enable ? float_traits<double>::exp_mask + 1 : 1] = {};
+
+  // Whether to_decimal's integral part, after the round-up, has 16 digits.
+  static ZMIJ_CONSTEXPR auto has_extra_digit(uint128 pow10, unsigned shift,
+                                             uint64_t bin_sig) noexcept
+      -> bool {
+    constexpr int extra_shift = exp_shift_table::extra_shift;
+    uint128 p = umul192_hi128(pow10.hi, pow10.lo, bin_sig << shift);
+    uint64_t integral = p.hi >> extra_shift;
+    uint64_t fractional = p.hi << (64 - extra_shift) | p.lo >> extra_shift;
+    uint64_t half_ulp =
+        (pow10.hi >> (extra_shift + 1 - shift)) + (1 - (bin_sig & 1));
+    integral += fractional + half_ulp < fractional;
+    return integral >= uint64_t(1e15);
+  }
+
+  static ZMIJ_CONSTEXPR auto make() -> double_exp_table {
+    using traits = float_traits<double>;
+    double_exp_table t;
+    for (int raw_exp = 1; raw_exp < int(traits::exp_mask) && enable;
+         ++raw_exp) {
+      int bin_exp = raw_exp - traits::exp_offset;
+      int dec_exp = compute_dec_exp(bin_exp);
+      unsigned shift = exp_shift_table::compute_shift(bin_exp, dec_exp);
+      uint128 pow10 = zmij::detail::compute_pow10(-dec_exp - 1);
+      uint64_t implicit_bit = uint64_t(1) << num_sig_bits;
+      bool lo_extra = has_extra_digit(pow10, shift, implicit_bit);
+      bool hi_extra = has_extra_digit(pow10, shift, 2 * implicit_bit - 1);
+      uint64_t code = encode(dec_exp + traits::max_digits10 - 2, lo_extra);
+      uint64_t carry = 0;
+      if (lo_extra != hi_extra) {
+        // The digit count changes where the value comes within half an ulp of
+        // 10**(dec_exp + 16), so the first significand with the extra digit
+        // is that power of ten over 2**bin_exp, rounded down or up.
+        uint64_t sig = zmij::detail::compute_pow10(dec_exp + 16).hi >>
+                       (63 - num_sig_bits);
+        if (!has_extra_digit(pow10, shift, sig)) ++sig;
+        carry = 2 * implicit_bit - sig;
+      }
+      // The implicit bit of the significand adds one to the code.
+      t.data[raw_exp] = ((code - 1) << num_sig_bits) + carry;
+    }
+    return t;
+  }
+};
+
+// fixed_layout_table with one entry per double_exp_table code, so that an
+// entry is specific to has_extra_digit and the code indexes it directly.
+struct double_layout_table {
+  static constexpr bool enable = double_exp_table::enable &&
+                                 fixed_layout_table::enable &&
+                                 exp_string_table::enable;
+  using traits = float_traits<double>;
+  // Each display exponent has two codes: with an extra digit (odd) and without.
+  static constexpr unsigned code_lo =
+      unsigned(2 * (traits::min_fixed_dec_exp - double_exp_table::min_dec_exp) -
+               1);
+  static constexpr unsigned num_entries =
+      2 * unsigned(fixed_layout_table::num_entries);
+  // The index of the entry for decimal exponent 0 without an extra digit;
+  // the one with an extra digit precedes it.
+  static constexpr unsigned sci_index =
+      unsigned(2 * (0 - double_exp_table::min_dec_exp)) - code_lo;
+
+#if ZMIJ_USE_NEON || ZMIJ_USE_AVX512VBMI
+  // The index of the second permutation source: the last digit, the point and
+  // a '0' in its bytes 0 to 2.
+  static constexpr int second_source = ZMIJ_USE_NEON ? 16 : 32;
+  struct alignas(64) entry {
+    // Output byte j comes from the 16 significand digits (index < 16) or from
+    // the second source.
+    unsigned char perm[32];
+    // Offset past the end of the output from its start: entry 0 with a last
+    // digit, otherwise indexed by 1 + the number of trailing zeros among the
+    // 16 digits.
+    unsigned char end_pos[traits::max_digits10];
+  };
+  entry data[enable ? num_entries : 1] = {};
+
+  static ZMIJ_CONSTEXPR auto make() -> double_layout_table {
+    double_layout_table t;
+    for (unsigned i = 0; i < num_entries && enable; ++i) {
+      unsigned code = code_lo + i;
+      int extra = double_exp_table::has_extra_digit(code);
+      int dec_exp = double_exp_table::dec_exp(code);
+      fixed_layout_table::entry src = fixed_layout_table::compute(dec_exp);
+      entry& e = t.data[i];
+      int len = 16 + extra;  // Digits including the last one.
+      for (int j = 0; j < 32; ++j) {
+        // k is the index of the digit at j, if any.
+        int k = dec_exp < 0 ? j - (1 - dec_exp) : j <= dec_exp ? j : j - 1;
+        int point = dec_exp < 0 ? 1 : dec_exp + 1;
+        int index = second_source + 2;  // '0'
+        if (j == point)
+          index = second_source + 1;
+        else if (k == len - 1)
+          index = second_source;
+        else if (k >= 0 && k < len)
+          index = !extra + k;
+        e.perm[j] = uint8_t(index);
+      }
+      for (int j = !extra; j < traits::max_digits10; ++j) {
+        int index =
+            j == traits::max_digits10 - 1 ? 0 : traits::max_digits10 - 1 - j;
+        e.end_pos[index] = uint8_t(src.start_pos + src.end_pos[j + extra - 1]);
+      }
+    }
+    return t;
+  }
+#else
+  struct alignas(fixed_entry_align()) entry {
+#if ZMIJ_USE_SSE4_1
+    alignas(16) unsigned char shuffle[16];
+    unsigned char last_digit_pos;
+#endif
+    unsigned char start_pos;
+    unsigned char point_pos;
+    unsigned char shift_pos;
+    // Offset past the end of the output: entry 0 with a last digit, otherwise
+    // indexed by 1 + the number of trailing zeros among the 16 BCD digits.
+    unsigned char end_pos[traits::max_digits10];
+  };
+  entry data[enable ? num_entries : 1] = {};
+
+  static ZMIJ_CONSTEXPR auto make() -> double_layout_table {
+    double_layout_table t;
+    for (unsigned i = 0; i < num_entries && enable; ++i) {
+      unsigned code = code_lo + i;
+      bool extra = double_exp_table::has_extra_digit(code);
+      fixed_layout_table::entry src =
+          fixed_layout_table::compute(double_exp_table::dec_exp(code));
+      entry& e = t.data[i];
+#if ZMIJ_USE_SSE4_1
+      for (int j = 0; j < 16; ++j) e.shuffle[j] = src.shuffle[extra][j];
+      e.last_digit_pos = src.last_digit_pos[extra];
+#endif
+      e.start_pos = src.start_pos;
+      e.point_pos = src.point_pos;
+      e.shift_pos = src.shift_pos;
+      // j is the number of digits written minus one.
+      for (int j = !extra; j < traits::max_digits10; ++j) {
+        int index = j == traits::max_digits10 - 1 ? 0 : traits::max_digits10 - 1 - j;
+        e.end_pos[index] = src.end_pos[j + extra - 1];
+      }
+    }
+    return t;
+  }
+#endif  // ZMIJ_USE_NEON || ZMIJ_USE_AVX512VBMI
+};
+
+// exp_string_table indexed by double_exp_table code. Bytes 5 and 6 of an entry
+// hold the byte offset of the code's double_layout_table entry.
+struct double_exp_string_table {
+  static constexpr int layout_offset_pos = 40;
+  static constexpr bool enable = double_layout_table::enable;
+  static constexpr int num_codes = 1280;
+  uint64_t data[enable ? num_codes : 1] = {};
+
+  static ZMIJ_CONSTEXPR auto make() -> double_exp_string_table {
+    double_exp_string_table t;
+    for (int code = 0; code < num_codes && enable; ++code) {
+      int e = double_exp_table::dec_exp(unsigned(code));
+      if (e < exp_string_table::min_dec_exp ||
+          e > float_traits<double>::max_exponent10)
+        continue;
+      // Fixed notation has an empty exponent string; scientific notation uses
+      // the layout of decimal exponent 0.
+      unsigned idx = unsigned(code) - double_layout_table::code_lo;
+      bool fixed = idx < double_layout_table::num_entries;
+      if (!fixed) idx = double_layout_table::sci_index - (unsigned(code) & 1);
+      uint64_t str = fixed ? 0 : exp_string_table::compute(e);
+      uint64_t mask = (uint64_t(0xffff) << layout_offset_pos);
+      t.data[code] =
+          (str & ~mask) |
+          (uint64_t(idx * sizeof(double_layout_table::entry))
+           << layout_offset_pos);
+    }
+    return t;
+  }
+};
+
 struct data {
   static constexpr auto splat64(uint64_t x) -> uint128 { return {x, x}; }
   static constexpr auto splat32(uint32_t x) -> uint128 {
@@ -890,6 +1118,14 @@ struct data {
   float_pow10_table float_pow10s = exp_shift_table::enable
                                        ? float_pow10_table::make()
                                        : float_pow10_table();
+  double_exp_table double_exps =
+      double_exp_table::enable ? double_exp_table::make() : double_exp_table();
+  double_layout_table double_layouts = double_layout_table::enable
+                                           ? double_layout_table::make()
+                                           : double_layout_table();
+  double_exp_string_table double_exp_strings =
+      double_exp_string_table::enable ? double_exp_string_table::make()
+                                      : double_exp_string_table();
   float_exp_table float_exps =
       float_exp_table::enable ? float_exp_table::make() : float_exp_table();
 
@@ -1210,6 +1446,47 @@ ZMIJ_INLINE void write_digits(char* buffer, uint64_t digits,
   memcpy(buffer, &digits, sizeof(digits));
 }
 
+#if ZMIJ_USE_NEON
+ZMIJ_INLINE void write_permuted(char* out, uint16x8_t digits, uint32_t tail,
+                                const unsigned char* perm) noexcept {
+  uint8x16x2_t src = {
+      {vreinterpretq_u8_u16(digits), vreinterpretq_u8_u32(vdupq_n_u32(tail))}};
+  uint8x16_t lo = vqtbl2q_u8(src, vld1q_u8(perm));
+  uint8x16_t hi = vqtbl2q_u8(src, vld1q_u8(perm + 16));
+  vst1q_u8(reinterpret_cast<uint8_t*>(out), lo);
+  vst1q_u8(reinterpret_cast<uint8_t*>(out) + 16, hi);
+}
+#elif ZMIJ_USE_AVX512VBMI && ZMIJ_CLANG
+ZMIJ_INLINE void write_permuted(char* out, __m128i digits, uint32_t tail,
+                                const unsigned char* perm) noexcept {
+  __m256i idx = _mm256_load_si256(reinterpret_cast<const __m256i*>(perm));
+  __m256i res = _mm256_permutex2var_epi8(
+      _mm256_castsi128_si256(digits), idx,
+      _mm256_castsi128_si256(_mm_cvtsi32_si128(int(tail))));
+  _mm256_storeu_si256(reinterpret_cast<__m256i*>(out), res);
+}
+#elif ZMIJ_USE_AVX512VBMI
+// GCC realigns the stack of any function with a 256-bit variable, so the YMM
+// instructions are written out on XMM operands.
+ZMIJ_INLINE void write_permuted(char* out, __m128i digits, uint32_t tail,
+                                const unsigned char* perm) noexcept {
+  __m128i second = _mm_cvtsi32_si128(int(tail)), idx;
+  ZMIJ_ASM(("vmovdqa %[p], %t[i]\n\t"
+            "vpermt2b %t[b], %t[i], %t[a]\n\t"
+            "vmovdqu %t[a], %[o]\n\t"
+            "vzeroupper"
+            : [a] "+x"(digits), [i] "=&x"(idx),
+              [o] "=m"(*reinterpret_cast<char (*)[32]>(out))
+            : [b] "x"(second),
+              [p] "m"(*reinterpret_cast<const char (*)[32]>(perm))));
+}
+#endif
+#if ZMIJ_USE_NEON || ZMIJ_USE_AVX512VBMI
+// For the float instantiation of write, which never calls it.
+inline void write_permuted(char*, uint64_t, uint32_t,
+                           const unsigned char*) noexcept {}
+#endif
+
 ZMIJ_INLINE auto write_float_simd(char* buffer, const dec_digits<32>& dig,
                                   int last_digit, bool has_last_digit,
                                   unsigned exp_code, const data& d) noexcept
@@ -1306,7 +1583,7 @@ struct shortest_decimal {
   int exp;
   int last_digit ZMIJ_DEFAULT(0);
   bool has_last_digit ZMIJ_DEFAULT(false);
-  unsigned exp_code ZMIJ_DEFAULT(0);  // A float_exp_table code, float only.
+  unsigned exp_code ZMIJ_DEFAULT(0);  // A float_exp_table or double_exp_table code.
 };
 
 // Here be 🐉s.
@@ -1354,6 +1631,10 @@ ZMIJ_INLINE auto to_decimal(UInt bin_sig, int64_t raw_exp, bool regular,
       exp_code = float_exp_table::encode(
           dec_exp + float_traits<float>::max_digits10 - 2,
           float_exp_table::num_extra_digits(integral));
+    } else {
+      exp_code = double_exp_table::encode(
+          dec_exp + traits::max_digits10 - 2,
+          integral >= uint64_t(1e15));
     }
     return {integral, dec_exp, digit, (round_up + round_down) == 0, exp_code};
   }
@@ -1453,7 +1734,16 @@ ZMIJ_INLINE auto to_decimal(UInt bin_sig, int64_t raw_exp, bool regular,
   uint128 pow10 = exp_shift_table::enable
                       ? d.pow10_significands.by_row(row)
                       : d.pow10_significands[-dec_exp - 1];
-  uint128 p = umul192_hi128(pow10.hi, pow10.lo, bin_sig << (shift & 63));
+  uint64_t scaled_sig = bin_sig << (shift & 63);
+  // Computed here so that neither bin_sig nor raw_exp stays live across the
+  // multiplication.
+  unsigned exp_code = 0;
+  if (double_exp_table::enable) {
+    exp_code = unsigned((d.double_exps.data[raw_exp] + bin_sig) >>
+                        double_exp_table::num_sig_bits);
+    if (ZMIJ_X86_64) ZMIJ_ASM(("" : "+r"(exp_code)));
+  }
+  uint128 p = umul192_hi128(pow10.hi, pow10.lo, scaled_sig);
 
   uint64_t integral = p.hi >> extra_shift;
   uint64_t fractional = p.hi << (64 - extra_shift) | p.lo >> extra_shift;
@@ -1468,7 +1758,11 @@ ZMIJ_INLINE auto to_decimal(UInt bin_sig, int64_t raw_exp, bool regular,
   static_assert(extra_shift >= 4, "top four bits of fractional all in p.hi");
   size_t cell = (p.hi >> (extra_shift - 4)) & 15;
   int digit = int((fractional + d.digit_offsets[cell]) >> 60);
-  return {integral, dec_exp, digit, (round_up + round_down) == 0};
+  if (!double_exp_table::enable) {
+    exp_code = double_exp_table::encode(dec_exp + traits::max_digits10 - 2,
+                                        integral >= uint64_t(1e15));
+  }
+  return {integral, dec_exp, digit, (round_up + round_down) == 0, exp_code};
 }
 
 struct scaled_value {
@@ -1589,6 +1883,15 @@ auto write(char* buffer, Float value) noexcept -> char* {
   auto bits = traits::to_bits(value);
   auto bin_exp = traits::get_exp(bits);  // binary exponent
   auto bin_sig = traits::get_sig(bits);  // binary significand
+#if defined(__clang__) && defined(__BMI2__)
+  // Clang's bzhi takes its bit count from a byte register and then depends on
+  // the previous value of the full register; mask with a constant instead.
+  if (traits::num_bits == 64) {
+    uint64_t sig_mask = traits::implicit_bit - 1;
+    ZMIJ_ASM(("" : "+r"(sig_mask)));
+    bin_sig = decltype(bin_sig)(bits & sig_mask);
+  }
+#endif
 
   *buffer = '-';
   buffer += traits::is_negative(bits);
@@ -1621,6 +1924,9 @@ auto write(char* buffer, Float value) noexcept -> char* {
       dec.exp_code = float_exp_table::encode(
           dec.exp + traits::max_digits10 - 2,
           float_exp_table::num_extra_digits(dec.sig));
+    } else {
+      dec.exp_code = double_exp_table::encode(
+          dec.exp + traits::max_digits10 - 2, dec.sig >= threshold);
     }
   } else {
     dec = ::to_decimal<Float>(bin_sig | traits::implicit_bit, bin_exp,
@@ -1629,6 +1935,10 @@ auto write(char* buffer, Float value) noexcept -> char* {
   bool has_last_digit = dec.has_last_digit;
   bool has_extra_digit = dec.sig >= threshold;
   int dec_exp = dec.exp + traits::max_digits10 - 2 + has_extra_digit;
+  if (traits::num_bits == 64) {
+    has_extra_digit = double_exp_table::has_extra_digit(dec.exp_code);
+    dec_exp = double_exp_table::dec_exp(dec.exp_code);
+  }
   // The shuffle table has rows for 6-digit significands.
   if ZMIJ_UNLIKELY (traits::num_bits == 32 && !float_shuffle_table::enable &&
                     dec.sig < uint32_t(1e6)) {
@@ -1647,6 +1957,69 @@ auto write(char* buffer, Float value) noexcept -> char* {
   // Write significand/fixed.
   char* start = buffer;
   constexpr int bcd_size = traits::num_bits == 64 ? 16 : 8;
+  if (traits::num_bits == 64 && double_layout_table::enable) {
+    // The code selects the layout and the exponent string. Scientific
+    // notation is the fixed layout of decimal exponent 0 followed by the
+    // exponent string, which is empty for fixed notation.
+    unsigned code = dec.exp_code;
+    const uint64_t* exp_strings = d->double_exp_strings.data;
+    // x86 reads the layout offset and the string with two loads, the string
+    // after the stores below so that the loads are not merged into one load
+    // and a shift.
+    uint64_t exp_data = 0;
+    size_t layout_offset = 0;
+    if (ZMIJ_X86_64) {
+      uint16_t offset16;
+      memcpy(&offset16,
+             reinterpret_cast<const char*>(exp_strings + code) +
+                 double_exp_string_table::layout_offset_pos / 8,
+             2);
+      layout_offset = offset16;
+    } else {
+      exp_data = exp_strings[code];
+      layout_offset =
+          (exp_data >> double_exp_string_table::layout_offset_pos) & 0xffff;
+    }
+    size_t end_index =
+        size_t(select(has_last_digit, 0, bcd_size + 1 - dig.num_digits));
+    const auto* layouts = d->double_layouts.data;
+    if (ZMIJ_AARCH64) ZMIJ_ASM(("" : "+r"(layouts)));
+    const auto& layout = *reinterpret_cast<const double_layout_table::entry*>(
+        reinterpret_cast<const char*>(layouts) + layout_offset);
+#if ZMIJ_USE_NEON || ZMIJ_USE_AVX512VBMI
+    // The second source: the last digit, '.' and '0'.
+    uint32_t tail =
+        uint32_t(0x302e30) + uint32_t(-int(has_last_digit) & dec.last_digit);
+    write_permuted(start, dig.digits, tail, layout.perm);
+#elif ZMIJ_USE_SSE4_1
+    memcpy(start, &zeros, 8);  // For dec_exp < 0.
+    char last_digit = char('0' + (-int(has_last_digit) & dec.last_digit));
+    buffer += layout.start_pos;
+    auto& digits = reinterpret_cast<const __m128i&>(dig.digits);
+    __m128i tbl = _mm_load_si128(m128ptr(layout.shuffle));
+    __m128i out = _mm_shuffle_epi8(digits, tbl);
+    memcpy(buffer, &out, bcd_size);
+    buffer[bcd_size] = char(_mm_extract_epi8(digits, 15));
+    start[layout.point_pos] = '.';
+    buffer[layout.last_digit_pos] = last_digit;
+#else
+    memcpy(start, &zeros, 8);  // For dec_exp < 0.
+    char last_digit = char('0' + (-int(has_last_digit) & dec.last_digit));
+    buffer += layout.start_pos;
+    unsigned extra = code & 1;
+    write_digits(buffer, dig.digits, !extra, *d);
+    buffer[bcd_size - 1 + extra] = last_digit;
+    unsigned point_pos = layout.point_pos;
+    memmove(start + layout.shift_pos, start + point_pos, bcd_size);
+    start[point_pos] = '.';
+#endif
+    buffer += layout.end_pos[end_index];
+    if (ZMIJ_X86_64) exp_data = exp_strings[code];
+    int len = int(exp_data >> 56);
+    if (is_big_endian) exp_data = bswap64(exp_data);
+    memcpy(buffer, &exp_data, 8);
+    return buffer + len;
+  }
   if (dec_exp >= traits::min_fixed_dec_exp &&
       dec_exp <= traits::max_fixed_dec_exp) {
     memcpy(start, &zeros, 8);  // For dec_exp < 0.

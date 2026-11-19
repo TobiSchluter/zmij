@@ -86,6 +86,14 @@ two grids is all of `## The grid at k`.
 `ulp_scaled_bounds` is the other thing `exact_candidate_correct` asks for: at
 Żmij's exponent one ULP spans between one and ten grid steps, so the fine case
 has a grid to be correctly rounded on.
+
+Separate from all of the above, `## The digit count` proves the table the
+writer reads the significand's digit count from, `double_exp_table`:
+
+    exp_code_eq
+      ← extra_digit_iff
+          ← extra_digit_iff_scaled  ← round_up_iff_gap, gap_le_step
+          ← scaled_iff_threshold
 -/
 
 namespace Zmij
@@ -1856,5 +1864,146 @@ theorem correct (f : ℕ) (e : ℤ) (hr : binary64.Regular f e) :
   obtain ⟨hfine, hcoarse⟩ := ulp_scaled_bounds e hr.range
   exact exact_candidate_correct f e (binary64.decimalExponent e) hr.pos
     hfine hcoarse (exact_candidate f e hr)
+
+/-! ## The digit count
+
+The writer needs the number of digits of the significand before it lays the
+output out, and zmij reads it from the exponent and the binary significand
+instead of from the decimal significand: `double_exp_table` holds, per binary
+exponent, a threshold on `f`, placed so that adding `f` to the entry carries
+into the code above exactly from the first significand whose coarse candidate
+has sixteen digits. The coarse candidate is the integral part after the
+round-up, so the claim is about `toDecimalCandidates`, not about the value
+alone, and `correct` does not cover it.
+
+In the integer scale the candidate reaches `10^15` exactly when the value is
+within half a ULP of `10^15` steps, the tie going to even `f` as in
+`round_up_iff_gap`. That is a comparison of `(2f+1)·num` with
+`2·10^15·step`, hence a threshold on `f`; `digitThreshold` is that threshold
+and `expCodeEntry` the table entry built from it.
+-/
+
+/-- The coarse candidate has sixteen digits exactly when the value is at least
+    `10^15` steps less half a ULP, ties to even. -/
+theorem extra_digit_iff_scaled (f : ℕ) (e : ℤ) (hr : binary64.Regular f e) :
+    10 ^ 15 ≤ (toDecimalCandidates f e).integral
+      ↔ if f % 2 = 0 then 2 * 10 ^ 15 * step e ≤ (2 * f + 1) * num e
+        else 2 * 10 ^ 15 * step e < (2 * f + 1) * num e := by
+  have hs := (exponent_shift_range e hr.range).2
+  have hsplit := integral_add_gap f e hs
+  have hgap := gap_le_step f e hr
+  have hup := round_up_iff_gap f e hr
+  have hnum := num_pos e hr.range
+  obtain ⟨hlt, -⟩ := grid_bounds e hr.range
+  have hint : (toDecimalCandidates f e).integral
+      = integralPart f e
+        + (if (toDecimalCandidates f e).roundUp then 1 else 0) := rfl
+  have hexp : (2 * f + 1) * num e = 2 * (f * num e) + num e := by ring
+  rw [hint, hexp, ← hsplit]
+  rcases Nat.lt_trichotomy (integralPart f e + 1) (10 ^ 15) with hi | hi | hi
+  · -- Two or more short: not even the round-up reaches.
+    have hm : (integralPart f e + 2) * step e ≤ 10 ^ 15 * step e :=
+      Nat.mul_le_mul_right _ (by omega)
+    have hl : (integralPart f e + 2) * step e
+        = integralPart f e * step e + 2 * step e := by ring
+    have hr' : 2 * 10 ^ 15 * step e = 2 * (10 ^ 15 * step e) := by ring
+    split_ifs <;> omega
+  · -- One short: the round-up decides.
+    have hl : 2 * 10 ^ 15 * step e
+        = 2 * (integralPart f e * step e) + 2 * step e := by
+      rw [← hi]; ring
+    by_cases hru : (toDecimalCandidates f e).roundUp = true
+    · have := hup.mp hru
+      simp only [hru, ↓reduceIte]
+      split_ifs at this ⊢ <;> omega
+    · have := mt hup.mpr hru
+      have hf : (toDecimalCandidates f e).roundUp = false := by simpa using hru
+      simp only [hf, Bool.false_eq_true, ↓reduceIte]
+      split_ifs at this ⊢ <;> omega
+  · -- Already there.
+    have hm : 10 ^ 15 * step e ≤ integralPart f e * step e :=
+      Nat.mul_le_mul_right _ (by omega)
+    have hr' : 2 * 10 ^ 15 * step e = 2 * (10 ^ 15 * step e) := by ring
+    split_ifs <;> omega
+
+/-- The first significand at `e` whose coarse candidate has sixteen digits:
+    `2·10^15·step / num` halved and rounded up, except at an exact tie, which
+    an even significand takes and an odd one leaves to its successor. -/
+def digitThreshold (e : ℤ) : ℕ :=
+  let a := 2 * 10 ^ 15 * step e
+  let q := a / num e
+  if q % 4 = 1 ∧ a % num e = 0 then q / 2 else (q + 1) / 2
+
+/-- The comparison of `extra_digit_iff_scaled` is a threshold on `f`. -/
+theorem scaled_iff_threshold (f : ℕ) (e : ℤ) (he : -1074 ≤ e ∧ e ≤ 971) :
+    (if f % 2 = 0 then 2 * 10 ^ 15 * step e ≤ (2 * f + 1) * num e
+      else 2 * 10 ^ 15 * step e < (2 * f + 1) * num e)
+      ↔ digitThreshold e ≤ f := by
+  have hnum := num_pos e he
+  rw [digitThreshold]
+  generalize 2 * 10 ^ 15 * step e = a
+  have hlt : a < (2 * f + 1) * num e ↔ a / num e < 2 * f + 1 :=
+    (Nat.div_lt_iff_lt_mul hnum).symm
+  have hle : a ≤ (2 * f + 1) * num e
+      ↔ a / num e < 2 * f + 1 ∨ (a / num e = 2 * f + 1 ∧ a % num e = 0) := by
+    constructor
+    · intro h
+      rcases Nat.lt_or_ge a ((2 * f + 1) * num e) with h1 | h1
+      · exact Or.inl (hlt.mp h1)
+      · have heq : a = (2 * f + 1) * num e := by omega
+        exact Or.inr ⟨by rw [heq, Nat.mul_div_cancel _ hnum],
+          by rw [heq, Nat.mul_mod_left]⟩
+    · rintro (h | ⟨hq, hm⟩)
+      · exact (hlt.mpr h).le
+      · have := Nat.div_add_mod a (num e)
+        rw [hq, hm] at this
+        rw [← this]
+        simp [Nat.mul_comm]
+  rw [hlt, hle]
+  split_ifs <;> omega
+
+/-- The digit count as a threshold: the coarse candidate of a regular value has
+    sixteen digits exactly from `digitThreshold` on. -/
+theorem extra_digit_iff (f : ℕ) (e : ℤ) (hr : binary64.Regular f e) :
+    10 ^ 15 ≤ (toDecimalCandidates f e).integral ↔ digitThreshold e ≤ f :=
+  (extra_digit_iff_scaled f e hr).trans (scaled_iff_threshold f e hr.range)
+
+/-- Żmij's exponent code, `double_exp_table::encode`: twice the offset of the
+    exponent of the leading digit of a sixteen-digit significand, plus one when
+    the coarse candidate has sixteen digits and not fifteen. -/
+def expCode (f : ℕ) (e : ℤ) : ℕ :=
+  2 * Int.toNat (binary64.decimalExponent e + 345)
+    + (if 10 ^ 15 ≤ (toDecimalCandidates f e).integral then 1 else 0)
+
+/-- Żmij's `double_exp_table` entry for the raw exponent `e + 1075`: the code
+    of a fifteen-digit candidate less one in the bits above the significand,
+    and `2^53` less the threshold in the 52 bits below, so that the implicit
+    bit supplies the one and the significand carries from the threshold on. A
+    threshold outside the binade is clamped to its end, leaving no carry or
+    the carry of every significand. -/
+def expCodeEntry (e : ℤ) : ℕ :=
+  (2 * Int.toNat (binary64.decimalExponent e + 345) + 1) * 2 ^ 52
+    - max (2 ^ 52) (min (digitThreshold e) (2 ^ 53))
+
+/-- The table code is the exponent code: `(entry + f) >> 52` for a regular
+    normal `f`, implicit bit included. -/
+theorem exp_code_eq (f : ℕ) (e : ℤ) (hr : binary64.Regular f e)
+    (hn : 2 ^ 52 ≤ f) :
+    (expCodeEntry e + f) / 2 ^ 52 = expCode f e := by
+  have hlt : f < 2 ^ 53 := hr.sig_lt
+  have hk : -324 ≤ binary64.decimalExponent e :=
+    (binary64.decimal_exponent_range hr.range.1 hr.range.2).1
+  have hb : 1 ≤ Int.toNat (binary64.decimalExponent e + 345) := by omega
+  have hext := extra_digit_iff f e hr
+  rw [expCode, expCodeEntry]
+  generalize Int.toNat (binary64.decimalExponent e + 345) = b at hb ⊢
+  generalize digitThreshold e = t at hext ⊢
+  by_cases ht : t ≤ f
+  · simp only [hext.mpr ht, ↓reduceIte]
+    rw [Nat.div_eq_iff (by positivity)]
+    omega
+  · simp only [mt hext.mp ht, ↓reduceIte]
+    rw [Nat.div_eq_iff (by positivity)]
+    omega
 
 end Zmij
